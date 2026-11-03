@@ -36,6 +36,9 @@ const TRANSCODE = env("TRANSCODE", "auto"); // auto: re-encode only non-H.264 vi
 const MAX_HEIGHT = Number(env("MAX_HEIGHT", 1080));
 const ALLOW_GENERIC = env("ALLOW_GENERIC", "false") === "true"; // yt-dlp's generic extractor (any page / raw media URL)
 const TRUST_PROXY = env("TRUST_PROXY", "loopback, uniquelocal");
+const CHANNELS_FILE = env("CHANNELS_FILE", "/data/channels.json"); // saved channels survive restarts here
+const CHANNEL_WAIT_SECONDS = Number(env("CHANNEL_WAIT_SECONDS", 25)); // a channel's first playlist fetch waits this long for its start
+const CHANNEL_RETRY_SECONDS = Number(env("CHANNEL_RETRY_SECONDS", 20)); // after a failed start (channel offline), wait before trying again
 
 const FORMAT = env(
   "YTDLP_FORMAT",
@@ -83,7 +86,8 @@ const ID_RE = /^[A-Za-z0-9_-]{22}$/;
 const FILE_RE = /^(index\.m3u8|seg_\d{6}\.ts)$/;
 
 const newId = () => crypto.randomBytes(16).toString("base64url");
-const playUrl = (s) => `${PUBLIC_STREAM_BASE}/s/${s.id}/index.m3u8`;
+const playUrl = (s) => (s.channel ? channelUrl(s.channel) : `${PUBLIC_STREAM_BASE}/s/${s.id}/index.m3u8`);
+const channelUrl = (key) => `${PUBLIC_STREAM_BASE}/c/${key}/index.m3u8`;
 const tail = (buf) => buf.trim().split("\n").filter(Boolean).slice(-3).join(" | ").slice(0, 600);
 const active = (s) => s.status === "starting" || s.status === "live";
 const log = (s, ...a) => console.log(new Date().toISOString(), s ? `[${s.id.slice(0, 6)}]` : "", ...a);
@@ -102,8 +106,72 @@ function publicView(s) {
     viewers: s.viewers.size,
     createdAt: new Date(s.createdAt).toISOString(),
     lastFetchAt: new Date(s.lastSeen).toISOString(),
+    channel: s.channel ?? undefined,
     playUrl: playUrl(s),
   };
+}
+
+// ---------------------------------------------------------------- saved channels
+// A channel is a saved URL with a permanent, unguessable key. Its play URL never changes: the first fetch after it went idle
+// (or after the source went offline) starts yt-dlp again. Saving one takes the password; watching one takes only the key, and a
+// key can only ever start the URL it was saved with.
+
+/** @type {Map<string, { key: string, url: string, name: string, createdAt: string }>} */
+const channels = new Map();
+async function loadChannels() {
+  try {
+    for (const c of JSON.parse(await fsp.readFile(CHANNELS_FILE, "utf8"))) channels.set(c.key, c);
+    log(null, `loaded ${channels.size} channel(s) from ${CHANNELS_FILE}`);
+  } catch (e) {
+    if (e.code !== "ENOENT") console.error("could not read", CHANNELS_FILE, e.message);
+  }
+}
+async function saveChannels() {
+  await fsp.mkdir(path.dirname(CHANNELS_FILE), { recursive: true });
+  const tmp = `${CHANNELS_FILE}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify([...channels.values()], null, 1));
+  await fsp.rename(tmp, CHANNELS_FILE);
+}
+const channelView = (c) => {
+  const s = streamOfChannel(c.key);
+  return { ...c, playUrl: channelUrl(c.key), status: s?.status ?? "idle", title: s?.title ?? undefined };
+};
+const streamOfChannel = (key) => {
+  let best;
+  for (const s of streams.values()) if (s.channel === key && (!best || s.createdAt > best.createdAt)) best = s;
+  return best;
+};
+const activeCount = () => [...streams.values()].filter(active).length;
+
+function parseUrl(raw) {
+  let url;
+  try { url = new URL(String(raw ?? "")); } catch { return null; }
+  return /^https?:$/.test(url.protocol) && url.href.length <= 2048 ? url.href : null;
+}
+
+// Make a stream for `url` and start it in the background; the returned promise settles when it is live or failed.
+function createStream(url, channel) {
+  const id = newId();
+  const s = { id, url, channel, title: null, isLive: null, status: "starting", createdAt: Date.now(), lastSeen: Date.now(),
+              dir: path.join(DATA_DIR, id), viewers: new Map(), procs: [], transcode: false };
+  streams.set(id, s);
+  s.started = startStream(s).catch((e) => {
+    s.error = s.error ?? e.message;
+    stopStream(s, "failed");
+    log(s, "failed:", s.error);
+  });
+  return s;
+}
+
+// The stream a channel's viewer should read now, starting one when none is running (null: none can start right now).
+function channelStream(c) {
+  const s = streamOfChannel(c.key);
+  if (s && active(s)) return s;
+  if (s?.status === "failed" && Date.now() - s.createdAt < CHANNEL_RETRY_SECONDS * 1000) return null;
+  if (activeCount() >= MAX_STREAMS) return null;
+  const n = createStream(c.url, c.key);
+  log(n, `channel ${c.key.slice(0, 6)} (${c.name}) starting for a viewer`);
+  return n;
 }
 
 function run(cmd, args, timeoutMs) {
@@ -225,36 +293,65 @@ setInterval(() => {
 const control = express();
 control.disable("x-powered-by");
 control.set("trust proxy", TRUST_PROXY);
+// Open CORS: a game's in-browser menu calls this API directly. Every call but /healthz needs the password, and no cookies are used.
+control.use((req, res, next) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "600",
+  });
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 control.use(express.json({ limit: "16kb" }));
 
-control.get("/healthz", (_req, res) => res.json({ ok: true, streams: [...streams.values()].filter(active).length }));
+control.get("/healthz", (_req, res) => res.json({ ok: true, streams: activeCount(), channels: channels.size }));
 
 control.post("/streams", requirePassword, async (req, res) => {
-  const raw = req.body?.url;
-  let url;
-  try { url = new URL(String(raw ?? "")); } catch { return res.status(400).json({ error: "url must be an http(s) URL" }); }
-  if (!/^https?:$/.test(url.protocol) || url.href.length > 2048) return res.status(400).json({ error: "url must be an http(s) URL" });
+  const url = parseUrl(req.body?.url);
+  if (!url) return res.status(400).json({ error: "url must be an http(s) URL" });
 
   // Same URL already running → share it (two viewers, one relay).
-  for (const s of streams.values()) if (s.url === url.href && active(s)) return res.status(200).json({ ...publicView(s), reused: true });
-  if ([...streams.values()].filter(active).length >= MAX_STREAMS)
-    return res.status(503).json({ error: `already relaying ${MAX_STREAMS} streams; DELETE one first` });
+  for (const s of streams.values()) if (s.url === url && active(s)) return res.status(200).json({ ...publicView(s), reused: true });
+  if (activeCount() >= MAX_STREAMS) return res.status(503).json({ error: `already relaying ${MAX_STREAMS} streams; DELETE one first` });
 
-  const id = newId();
-  const s = { id, url: url.href, title: null, isLive: null, status: "starting", createdAt: Date.now(), lastSeen: Date.now(),
-              dir: path.join(DATA_DIR, id), viewers: new Map(), procs: [], transcode: false };
-  streams.set(id, s);
-  log(s, `requested ${url.href} from ${req.ip}`);
-
-  const started = startStream(s).catch((e) => {
-    s.error = s.error ?? e.message;
-    stopStream(s, "failed");
-    log(s, "failed:", s.error);
-  });
+  const s = createStream(url);
+  log(s, `requested ${url} from ${req.ip}`);
   if (req.body?.wait === false) return res.status(202).json(publicView(s));
-  await started;
+  await s.started;
   if (s.status === "live") return res.status(201).json(publicView(s));
   return res.status(502).json({ ...publicView(s), error: s.error ?? "stream failed" });
+});
+
+// Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl }. The same URL saved twice is one channel.
+// The URL is checked with yt-dlp first; one that can't play right now (a channel that is offline) is still saved, with `warning`.
+control.post("/channels", requirePassword, async (req, res) => {
+  const url = parseUrl(req.body?.url);
+  if (!url) return res.status(400).json({ error: "url must be an http(s) URL" });
+  const name = String(req.body?.name ?? "").trim().slice(0, 60);
+  for (const c of channels.values()) if (c.url === url) {
+    if (name && name !== c.name) { c.name = name; await saveChannels(); }
+    return res.json({ ...channelView(c), reused: true });
+  }
+  let title = null, warning;
+  try { title = (await probe(url)).title; } catch (e) { warning = `saved, but it doesn't play right now: ${e.message}`; }
+  const c = { key: newId(), url, name: name || title?.slice(0, 60) || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
+  channels.set(c.key, c);
+  await saveChannels();
+  log(null, `channel ${c.key.slice(0, 6)} saved: ${c.name} ← ${url} (from ${req.ip})`);
+  return res.status(201).json({ ...channelView(c), warning });
+});
+
+control.get("/channels", requirePassword, (_req, res) => res.json([...channels.values()].map(channelView)));
+
+control.delete("/channels/:key", requirePassword, async (req, res) => {
+  const c = channels.get(req.params.key);
+  if (!c) return res.status(404).json({ error: "no such channel" });
+  channels.delete(c.key);
+  await saveChannels();
+  for (const s of streams.values()) if (s.channel === c.key && active(s)) stopStream(s, "channel deleted");
+  return res.json({ deleted: c.key });
 });
 
 control.get("/streams", requirePassword, (_req, res) => res.json([...streams.values()].map(publicView)));
@@ -297,6 +394,27 @@ stream.get("/s/:id/:file", (req, res) => {
   const { id, file } = req.params;
   const s = ID_RE.test(id) && FILE_RE.test(file) ? streams.get(id) : undefined;
   if (!s || s.status === "failed") return res.status(404).end();
+  serveFile(req, res, s, file);
+});
+
+// A saved channel: its key is its address for good. The first playlist fetch after it went idle starts it and waits for it.
+stream.get("/c/:key/:file", async (req, res) => {
+  const { key, file } = req.params;
+  const c = ID_RE.test(key) && FILE_RE.test(file) ? channels.get(key) : undefined;
+  if (!c) return res.status(404).end();
+  let s = streamOfChannel(key);
+  if (file === "index.m3u8") {
+    if (!s || !active(s)) s = channelStream(c);
+    if (!s) return res.status(503).set("Retry-After", String(CHANNEL_RETRY_SECONDS)).end();
+    s.lastSeen = Date.now();
+    if (s.status === "starting") await Promise.race([s.started, new Promise((r) => setTimeout(r, CHANNEL_WAIT_SECONDS * 1000))]);
+    if (s.status !== "live" && s.status !== "ended") return res.status(503).set("Retry-After", "5").end();
+  }
+  if (!s || s.status === "failed") return res.status(404).end();
+  serveFile(req, res, s, file);
+});
+
+function serveFile(req, res, s, file) {
   s.lastSeen = Date.now();
   s.viewers.set(req.ip, s.lastSeen);
   const isPlaylist = file.endsWith(".m3u8");
@@ -307,12 +425,13 @@ stream.get("/s/:id/:file", (req, res) => {
   res.sendFile(path.join(s.dir, file), { dotfiles: "deny", lastModified: false, cacheControl: false }, (err) => {
     if (err && !res.headersSent) res.status(404).end();
   });
-});
+}
 
 stream.use((_req, res) => res.status(404).end());
 
 // ---------------------------------------------------------------- boot
 
+await loadChannels();
 await fsp.mkdir(DATA_DIR, { recursive: true });
 for (const leftover of await fsp.readdir(DATA_DIR)) await fsp.rm(path.join(DATA_DIR, leftover), { recursive: true, force: true });
 control.listen(CONTROL_PORT, () => log(null, `control on :${CONTROL_PORT}`));

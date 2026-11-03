@@ -13,6 +13,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
+# Saved channels live in /data (a named volume in docker-compose.yml), owned by the user the app runs as.
+RUN mkdir -p /data && chown node:node /data
 
 ENV NODE_ENV=production \
     DATA_DIR=/tmp/relay \

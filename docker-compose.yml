@@ -18,3 +18,8 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${STREAM_HOST_PORT:-8081}:8081"
     tmpfs:
       - /tmp/relay:size=${SEGMENT_RAM:-1g},mode=1777 # segments live in RAM
+    volumes:
+      - channels:/data # saved channels (channels.json)
+
+volumes:
+  channels:

@@ -6,6 +6,7 @@ so a browser page on another site, such as a Spawn world's video texture, can pl
 ```
 POST :8080/streams {password, url}  →  { id, playUrl }
 GET  :8081/s/<id>/index.m3u8        →  the live stream (Access-Control-Allow-Origin: *)
+POST :8080/channels {password, url} →  { key, playUrl: :8081/c/<key>/index.m3u8 }  (a permanent address that restarts itself)
 ```
 
 One Node process (Express) listens on both ports. For each requested URL it runs `yt-dlp -o - <url> | ffmpeg … -f hls`.
@@ -30,7 +31,21 @@ Ten wrong passwords from one IP lock that IP out for 10 minutes.
 | `GET /streams` | – | every stream, with its status and recent viewer count |
 | `GET /streams/:id` | – | one stream |
 | `DELETE /streams/:id` | – | stops it |
+| `POST /channels` | `{ password, url, name? }` | saves the URL as a **channel** with a permanent key: `{ key, name, url, playUrl: …/c/<key>/index.m3u8 }`. Saving the same URL twice gives back the same channel. The URL is checked with yt-dlp first; one that can't play right now (an offline channel) is still saved, with a `warning`. |
+| `GET /channels` | – | every saved channel and whether it is running |
+| `DELETE /channels/:key` | – | forgets the channel and stops its stream |
 | `GET /healthz` | – | no password needed |
+
+The control API sends `Access-Control-Allow-Origin: *`, so a browser page (a game's menu) can call it directly. The person typing
+the password is the only gate.
+
+### Channels
+
+A channel's play URL never changes. A stream stops itself when nobody watches, but the next fetch of a channel's playlist starts
+it again: that first request waits up to `CHANNEL_WAIT_SECONDS` (25) for the stream to come up. If the source can't play (offline),
+the channel answers 503 and doesn't retry for `CHANNEL_RETRY_SECONDS` (20). A channel key only ever starts the URL it was saved with,
+so it can be handed to viewers (a game's world state) without the password. Channels are kept in `/data/channels.json`, on a
+named Docker volume.
 
 ```sh
 curl -s -X POST localhost:8080/streams -H 'content-type: application/json' \
