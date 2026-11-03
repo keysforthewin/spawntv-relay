@@ -49,6 +49,6 @@ Kick and Twitch work without cookies.
 ## Sound and picture out of step
 
 If the TV's sound plays behind its picture, set **Picture delay** on the TV's Relay tab to hold the picture back by that many
-seconds (−10 to 10; a negative number holds the sound back instead). It is the relay's setting, kept in `/data/settings.json`,
+seconds (−20 to 20; a negative number holds the sound back instead). It is the relay's setting, kept in `/data/settings.json`,
 and applies to every channel. Running channels restart with it, so viewers see a few seconds' gap. `VIDEO_DELAY_SECONDS` in
 `.env` is only its starting value.

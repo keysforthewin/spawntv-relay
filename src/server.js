@@ -34,11 +34,11 @@ const SEGMENT_SECONDS = Number(env("SEGMENT_SECONDS", 2));
 const LIST_SIZE = Number(env("LIST_SIZE", 8)); // segments in the live window
 const TRANSCODE = env("TRANSCODE", "auto"); // auto: re-encode only non-H.264 video · always · never
 const MAX_HEIGHT = Number(env("MAX_HEIGHT", 1080));
-// The picture plays this many seconds after the sound it came with (timestamps shifted, nothing re-encoded), to line them up when
+// The picture plays this many seconds after the sound it came with (the sound's timestamps shifted earlier), to line them up when
 // the player's sound runs late. 0 turns it off; a negative value delays the sound instead. This env value is only the starting
 // point: POST /settings { videoDelay } changes it at runtime (the SpawnTV's Relay tab does), kept in SETTINGS_FILE.
 const VIDEO_DELAY_SECONDS = Number(env("VIDEO_DELAY_SECONDS", 0));
-const MAX_DELAY_SECONDS = 10; // ffmpeg interleaves the two tracks within 10 s; a bigger shift would come out of order
+const MAX_DELAY_SECONDS = 20;
 const ALLOW_GENERIC = env("ALLOW_GENERIC", "false") === "true"; // yt-dlp's generic extractor (any page / raw media URL)
 const TRUST_PROXY = env("TRUST_PROXY", "loopback, uniquelocal");
 const CHANNELS_FILE = env("CHANNELS_FILE", "/data/channels.json"); // saved channels survive restarts here
@@ -256,11 +256,15 @@ function killGroup(p) {
   setTimeout(() => { try { process.kill(-p.pid, "SIGKILL"); } catch {} }, 5000).unref();
 }
 
-// setts shifts one track's packet timestamps after encoding, so it works with -c:v copy and with the transcode alike.
+// The delay moves the sound's timestamps (asetpts, in the audio filter: the sound is re-encoded anyway, the picture is copied): sound
+// shifted d seconds earlier plays with the picture from d seconds before, so the picture runs d behind. ffmpeg then lifts both
+// tracks so none starts below zero, and holds the picture back to interleave them, so every segment after the first carries
+// matching sound and picture; the stream reaches viewers d seconds later. (A setts bitstream filter on the video, the first way
+// this was done, changes nothing in ffmpeg 5.1's output.)
 function delayArgs(s) {
   const d = s.videoDelay;
   if (!Number.isFinite(d) || d === 0) return [];
-  return [d > 0 ? "-bsf:v" : "-bsf:a", `setts=ts=TS+${Math.abs(d)}/TB`];
+  return ["-af", `asetpts=PTS-(${d})/TB`, "-max_interleave_delta", String(Math.round((Math.abs(d) + 10) * 1e6))];
 }
 
 async function startStream(s) {
