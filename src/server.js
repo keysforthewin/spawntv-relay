@@ -256,15 +256,15 @@ function killGroup(p) {
   setTimeout(() => { try { process.kill(-p.pid, "SIGKILL"); } catch {} }, 5000).unref();
 }
 
-// The delay moves the sound's timestamps (asetpts, in the audio filter: the sound is re-encoded anyway, the picture is copied): sound
-// shifted d seconds earlier plays with the picture from d seconds before, so the picture runs d behind. ffmpeg then lifts both
-// tracks so none starts below zero, and holds the picture back to interleave them, so every segment after the first carries
-// matching sound and picture; the stream reaches viewers d seconds later. (A setts bitstream filter on the video, the first way
-// this was done, changes nothing in ffmpeg 5.1's output.)
+// The delay is made in the sound (it is re-encoded anyway; the picture is copied), and both tracks still start at the same instant,
+// because a player that starts the picture and the sound separately (Spawn's does) lines up each track's first sample and would
+// cancel a lead in the timestamps (the first way this was done: the setts filter, then asetpts alone; neither changed what was heard).
+// Picture late by d: the sound's first d seconds are cut, so from then on the sound is d seconds ahead of the picture beside it.
+// Sound late by d (negative): the sound starts with d seconds of silence.
 function delayArgs(s) {
   const d = s.videoDelay;
   if (!Number.isFinite(d) || d === 0) return [];
-  return ["-af", `asetpts=PTS-(${d})/TB`, "-max_interleave_delta", String(Math.round((Math.abs(d) + 10) * 1e6))];
+  return ["-af", d > 0 ? `asetpts=PTS-(${d})/TB,atrim=start=0` : `adelay=${Math.round(-d * 1000)}:all=1`];
 }
 
 async function startStream(s) {
