@@ -1,4 +1,4 @@
-// stream-relay: a password-gated yt-dlp → HLS relay.
+// SpawnTV Relay: a password-gated yt-dlp → HLS relay for the Spawn TV.
 //
 //   control port  POST /streams {password, url}  → { id, playUrl }   (yt-dlp | ffmpeg → rolling HLS on disk)
 //   stream port   GET  /s/<id>/index.m3u8 (+ segments)               (open CORS; only known ids, nothing fetched on demand)
@@ -356,7 +356,7 @@ control.get("/spawn-user/:name", requirePassword, async (req, res) => {
   const hit = spawnUsers.get(name);
   if (hit && Date.now() - hit.at < 600_000) return res.json(hit.v);
   const status = async (prefix) => {
-    const r = await fetch(`https://www.spawn.co/${prefix}${encodeURIComponent(name)}`, { redirect: "manual", headers: { "user-agent": "stream-relay" }, signal: AbortSignal.timeout(8000) });
+    const r = await fetch(`https://www.spawn.co/${prefix}${encodeURIComponent(name)}`, { redirect: "manual", headers: { "user-agent": "spawntv-relay" }, signal: AbortSignal.timeout(8000) });
     return r.status;
   };
   try {
