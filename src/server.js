@@ -57,6 +57,10 @@ const FORMAT = env(
 // YouTube needs a JavaScript runtime (Node is in the image) and, from a server IP, usually a logged-in cookies file: put one at
 // COOKIES_FILE (Netscape format, e.g. exported with a "cookies.txt" browser extension from a throwaway account) and it is used.
 const COOKIES_FILE = env("COOKIES_FILE", "/data/cookies.txt");
+// Each channel's streamer picture, saved when the channel is (src/streamer.py) and served at <stream>/a/<key>.<ext>.
+const AVATAR_DIR = env("AVATAR_DIR", path.join(path.dirname(CHANNELS_FILE), "avatars"));
+const STREAMER_PY = path.join(path.dirname(new URL(import.meta.url).pathname), "streamer.py");
+const STREAMER_REFRESH_DAYS = Number(env("STREAMER_REFRESH_DAYS", 7)); // a re-save after this long looks the streamer up again
 const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no-playlist", "--js-runtimes", "node"];
 if (fs.existsSync(COOKIES_FILE)) YTDLP_COMMON.push("--cookies", COOKIES_FILE);
 if (!ALLOW_GENERIC) YTDLP_COMMON.push("--use-extractors", "default,-generic");
@@ -127,7 +131,8 @@ function publicView(s) {
 // (or after the source went offline) starts yt-dlp again. Saving one takes the password; watching one takes only the key, and a
 // key can only ever start the URL it was saved with.
 
-/** @type {Map<string, { key: string, url: string, name: string, createdAt: string }>} */
+/** @type {Map<string, { key: string, url: string, name: string, named?: boolean, platform?: string, slug?: string,
+ *   streamer?: string, avatar?: string, streamerAt?: number, createdAt: string }>} */
 const channels = new Map();
 async function loadChannels() {
   try {
@@ -145,8 +150,28 @@ async function saveChannels() {
 }
 const channelView = (c) => {
   const s = streamOfChannel(c.key);
-  return { ...c, playUrl: channelUrl(c.key), status: s?.status ?? "idle", title: s?.title ?? undefined };
+  const avatarUrl = c.avatar ? `${PUBLIC_STREAM_BASE}/a/${c.avatar}?v=${c.streamerAt ?? 0}` : undefined;
+  return { ...c, avatarUrl, playUrl: channelUrl(c.key), status: s?.status ?? "idle", title: s?.title ?? undefined };
 };
+
+// Who streams on this channel (src/streamer.py): Kick, Twitch and YouTube give their slug, display name and picture. The
+// channel is named after the streamer, never the stream's title (it changes every broadcast), unless the saver named it.
+async function lookUpStreamer(c, hint) {
+  await fsp.mkdir(AVATAR_DIR, { recursive: true });
+  const r = await run("python3", [STREAMER_PY, c.url, path.join(AVATAR_DIR, c.key), hint ?? ""], 45_000);
+  let m = null;
+  try { m = JSON.parse(r.out.trim().split("\n").pop()); } catch {}
+  if (r.code !== 0 || !m) { log(null, `channel ${c.key.slice(0, 6)}: no streamer info (${tail(r.err) || r.code})`); return false; }
+  for (const f of await fsp.readdir(AVATAR_DIR)) // an older picture under another extension
+    if (f.startsWith(`${c.key}.`) && f !== `${c.key}.${m.avatarExt}`) await fsp.rm(path.join(AVATAR_DIR, f), { force: true });
+  Object.assign(c, {
+    platform: m.platform ?? undefined, slug: m.slug ?? undefined, streamer: m.name ?? undefined,
+    avatar: m.avatarExt ? `${c.key}.${m.avatarExt}` : undefined, streamerAt: Date.now(),
+  });
+  if (!c.named) c.name = String(m.name || m.slug || c.name).slice(0, 60);
+  return true;
+}
+const streamerStale = (c) => !c.streamerAt || Date.now() - c.streamerAt > STREAMER_REFRESH_DAYS * 86_400_000;
 const streamOfChannel = (key) => {
   let best;
   for (const s of streams.values()) if (s.channel === key && (!best || s.createdAt > best.createdAt)) best = s;
@@ -203,7 +228,8 @@ async function probe(url) {
   const info = JSON.parse(r.out);
   const fmts = info.requested_formats ?? [info];
   const pick = (k) => fmts.map((f) => f[k]).find((c) => c && c !== "none") ?? "none";
-  return { title: info.title ?? null, isLive: info.is_live === true, vcodec: pick("vcodec"), acodec: pick("acodec") };
+  return { title: info.title ?? null, isLive: info.is_live === true, vcodec: pick("vcodec"), acodec: pick("acodec"),
+    channelUrl: info.channel_url ?? info.uploader_url ?? null };
 }
 
 function killGroup(p) {
@@ -344,19 +370,25 @@ control.post("/streams", requirePassword, async (req, res) => {
   return res.status(502).json({ ...publicView(s), error: s.error ?? "stream failed" });
 });
 
-// Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl }. The same URL saved twice is one channel.
+// Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl, platform, slug, streamer, avatarUrl }. The same URL
+// saved twice is one channel. Its name is the streamer's (Kick, Twitch, YouTube), else the given name, else the stream title.
 // The URL is checked with yt-dlp first; one that can't play right now (a channel that is offline) is still saved, with `warning`.
 control.post("/channels", requirePassword, async (req, res) => {
   const url = parseUrl(req.body?.url);
   if (!url) return res.status(400).json({ error: "url must be an http(s) URL" });
   const name = String(req.body?.name ?? "").trim().slice(0, 60);
   for (const c of channels.values()) if (c.url === url) {
-    if (name && name !== c.name) { c.name = name; await saveChannels(); }
+    let changed = false;
+    if (name && name !== c.name) { Object.assign(c, { name, named: true }); changed = true; }
+    if (streamerStale(c)) changed = (await lookUpStreamer(c)) || changed;
+    if (changed) await saveChannels();
     return res.json({ ...channelView(c), reused: true });
   }
-  let title = null, warning;
-  try { title = (await probe(url)).title; } catch (e) { warning = `saved, but it doesn't play right now: ${e.message}`; }
-  const c = { key: newId(), url, name: name || title?.slice(0, 60) || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
+  let info = null, warning;
+  try { info = await probe(url); } catch (e) { warning = `saved, but it doesn't play right now: ${e.message}`; }
+  const c = { key: newId(), url, name: name || info?.title?.slice(0, 60) || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
+  if (name) c.named = true;
+  await lookUpStreamer(c, info?.channelUrl);
   channels.set(c.key, c);
   await saveChannels();
   log(null, `channel ${c.key.slice(0, 6)} saved: ${c.name} ← ${url} (from ${req.ip})`);
@@ -469,6 +501,17 @@ function serveFile(req, res, s, file) {
   });
 }
 
+// A channel's streamer picture (lookUpStreamer). Its URL carries ?v=<when it was looked up>, so it can be cached long.
+const AVATAR_RE = /^[A-Za-z0-9_-]{22}\.(png|jpg|webp|gif)$/;
+stream.get("/a/:file", (req, res) => {
+  const { file } = req.params;
+  if (!AVATAR_RE.test(file) || !channels.get(file.split(".")[0])?.avatar) return res.status(404).end();
+  res.set("Cache-Control", "public, max-age=86400");
+  res.sendFile(path.join(AVATAR_DIR, file), { dotfiles: "deny", lastModified: false, cacheControl: false }, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
 stream.use((_req, res) => res.status(404).end());
 
 // ---------------------------------------------------------------- boot
@@ -476,6 +519,12 @@ stream.use((_req, res) => res.status(404).end());
 await loadChannels();
 await fsp.mkdir(DATA_DIR, { recursive: true });
 for (const leftover of await fsp.readdir(DATA_DIR)) await fsp.rm(path.join(DATA_DIR, leftover), { recursive: true, force: true });
+// Channels saved before streamer lookups existed (or long ago) get their streamer in the background, one at a time.
+(async () => {
+  let n = 0;
+  for (const c of channels.values()) if (streamerStale(c) && (await lookUpStreamer(c))) n++;
+  if (n) { await saveChannels(); log(null, `looked up the streamer of ${n} channel(s)`); }
+})().catch((e) => console.error("streamer backfill:", e.message));
 control.listen(CONTROL_PORT, () => log(null, `control on :${CONTROL_PORT}`));
 stream.listen(STREAM_PORT, () => log(null, `stream on :${STREAM_PORT} → ${PUBLIC_STREAM_BASE}`));
 
