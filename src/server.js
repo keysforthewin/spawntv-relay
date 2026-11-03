@@ -50,7 +50,11 @@ const FORMAT = env(
     "b",
   ].join("/"),
 );
-const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no-playlist"];
+// YouTube needs a JavaScript runtime (Node is in the image) and, from a server IP, usually a logged-in cookies file: put one at
+// COOKIES_FILE (Netscape format, e.g. exported with a "cookies.txt" browser extension from a throwaway account) and it is used.
+const COOKIES_FILE = env("COOKIES_FILE", "/data/cookies.txt");
+const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no-playlist", "--js-runtimes", "node"];
+if (fs.existsSync(COOKIES_FILE)) YTDLP_COMMON.push("--cookies", COOKIES_FILE);
 if (!ALLOW_GENERIC) YTDLP_COMMON.push("--use-extractors", "default,-generic");
 
 // ---------------------------------------------------------------- auth

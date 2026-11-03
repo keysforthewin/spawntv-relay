@@ -107,3 +107,14 @@ behind nginx.
   keeps the relay from being pointed at internal addresses. Set it to `true` to allow raw `.m3u8`/`.mp4` links and arbitrary pages.
 - Sites change, and yt-dlp keeps up. Rebuild with `docker compose build --no-cache` to pull the newest version.
 - Rebroadcasting someone else's stream may be against that site's terms. This relay is meant for private use behind the password.
+
+### YouTube
+
+YouTube asks most server IPs to "sign in to confirm you're not a bot". Give yt-dlp a logged-in cookies file (Netscape format,
+exported with a cookies.txt browser extension, ideally from a throwaway Google account) at `/data/cookies.txt` on the volume and restart:
+
+```sh
+docker compose cp cookies.txt relay:/data/cookies.txt && docker compose restart
+```
+
+Kick and Twitch don't need this. yt-dlp runs YouTube's player JavaScript with the Node.js already in the image (`--js-runtimes node`).
