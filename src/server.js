@@ -34,6 +34,10 @@ const SEGMENT_SECONDS = Number(env("SEGMENT_SECONDS", 2));
 const LIST_SIZE = Number(env("LIST_SIZE", 8)); // segments in the live window
 const TRANSCODE = env("TRANSCODE", "auto"); // auto: re-encode only non-H.264 video · always · never
 const MAX_HEIGHT = Number(env("MAX_HEIGHT", 1080));
+// The picture plays this many seconds after the sound it came with (timestamps shifted, nothing re-encoded). The Spawn TV plays the
+// picture as a video texture and the sound in a separate <audio>, so this lines them up when the sound can't wait long enough on its
+// own. 0 turns it off; a negative value delays the sound instead.
+const VIDEO_DELAY_SECONDS = Number(env("VIDEO_DELAY_SECONDS", 5));
 const ALLOW_GENERIC = env("ALLOW_GENERIC", "false") === "true"; // yt-dlp's generic extractor (any page / raw media URL)
 const TRUST_PROXY = env("TRUST_PROXY", "loopback, uniquelocal");
 const CHANNELS_FILE = env("CHANNELS_FILE", "/data/channels.json"); // saved channels survive restarts here
@@ -205,6 +209,13 @@ function killGroup(p) {
   setTimeout(() => { try { process.kill(-p.pid, "SIGKILL"); } catch {} }, 5000).unref();
 }
 
+// setts shifts one track's packet timestamps after encoding, so it works with -c:v copy and with the transcode alike.
+function delayArgs() {
+  const d = VIDEO_DELAY_SECONDS;
+  if (!Number.isFinite(d) || d === 0) return [];
+  return [d > 0 ? "-bsf:v" : "-bsf:a", `setts=ts=TS+${Math.abs(d)}/TB`];
+}
+
 async function startStream(s) {
   const info = await probe(s.url);
   if (!active(s)) return; // stopped while probing
@@ -225,6 +236,7 @@ async function startStream(s) {
     "-map", "0:v:0", "-map", "0:a:0?",
     ...video,
     "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+    ...delayArgs(),
     "-f", "hls",
     "-hls_time", String(SEGMENT_SECONDS),
     "-hls_list_size", String(LIST_SIZE),
@@ -260,7 +272,7 @@ async function startStream(s) {
     scheduleCleanup(s);
   });
 
-  log(s, `started ${s.isLive ? "live" : "vod"} ${info.vcodec}/${info.acodec}${s.transcode ? " (transcoding)" : ""}: ${s.title}`);
+  log(s, `started ${s.isLive ? "live" : "vod"} ${info.vcodec}/${info.acodec}${s.transcode ? " (transcoding)" : ""}${VIDEO_DELAY_SECONDS ? `, video delay ${VIDEO_DELAY_SECONDS}s` : ""}: ${s.title}`);
   const playlist = path.join(s.dir, "index.m3u8");
   const deadline = Date.now() + READY_SECONDS * 1000;
   while (s.status === "starting" && Date.now() < deadline) {
