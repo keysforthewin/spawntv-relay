@@ -1,121 +1,46 @@
 # stream-relay
 
-A password-gated relay that turns any URL yt-dlp can read (Kick, Twitch, YouTube, …) into a plain HLS stream with open CORS,
-so a browser page on another site, such as a Spawn world's video texture, can play it.
-
-```
-POST :8080/streams {password, url}  →  { id, playUrl }
-GET  :8081/s/<id>/index.m3u8        →  the live stream (Access-Control-Allow-Origin: *)
-POST :8080/channels {password, url} →  { key, playUrl: :8081/c/<key>/index.m3u8 }  (a permanent address that restarts itself)
-```
-
-One Node process (Express) listens on both ports. For each requested URL it runs `yt-dlp -o - <url> | ffmpeg … -f hls`.
-ffmpeg writes a rolling window of 2-second segments to RAM (tmpfs), and the stream port serves that window to any number of viewers.
-Everyone watching an id sees the same live point, like a TV channel. A VOD (a YouTube video, say) is paced to real time, so it plays the same way.
+Turns a Kick, Twitch or YouTube link into a live HLS stream that the Spawn TV can play.
 
 ## Run
 
 ```sh
-cp .env.example .env        # then set RELAY_PASSWORD (openssl rand -base64 24)
-docker compose up --build
+git clone https://github.com/keysforthewin/stream-relay.git
+cd stream-relay
+cp .env.example .env
+nano .env                  # set RELAY_PASSWORD
+docker compose up -d --build
 ```
 
-## API (control port, 8080)
+## Configure
 
-The password goes in the JSON body as `password`, or as `Authorization: Bearer <password>`.
-Ten wrong passwords from one IP lock that IP out for 10 minutes.
-
-| Call | Body | Answer |
-|---|---|---|
-| `POST /streams` | `{ password, url, wait? }` | `201 { id, playUrl, title, isLive, status: "live", … }` once the first segments exist (waits up to `READY_SECONDS`). If that URL is already running, `200` with its id and `reused: true`. `wait: false` answers `202` at once with `status: "starting"`. `502 { error }` if yt-dlp or ffmpeg fails. |
-| `GET /streams` | – | every stream, with its status and recent viewer count |
-| `GET /streams/:id` | – | one stream |
-| `DELETE /streams/:id` | – | stops it |
-| `POST /channels` | `{ password, url, name? }` | saves the URL as a **channel** with a permanent key: `{ key, name, url, playUrl: …/c/<key>/index.m3u8 }`. Saving the same URL twice gives back the same channel. The URL is checked with yt-dlp first; one that can't play right now (an offline channel) is still saved, with a `warning`. |
-| `GET /channels` | – | every saved channel and whether it is running |
-| `DELETE /channels/:key` | – | forgets the channel and stops its stream |
-| `GET /spawn-user/:name` | – | `{ exists, name, kind: "person" \| "agent" \| null }`: whether `spawn.co/@name` (a person) or `spawn.co/@@name` (an agent) exists. Spawn has no public user search, so this only confirms a name. Cached 10 minutes. |
-| `GET /healthz` | – | no password needed |
-
-The control API sends `Access-Control-Allow-Origin: *`, so a browser page (a game's menu) can call it directly. The person typing
-the password is the only gate.
-
-### Channels
-
-A channel's play URL never changes. A stream stops itself when nobody watches, but the next fetch of a channel's playlist starts
-it again: that first request waits up to `CHANNEL_WAIT_SECONDS` (25) for the stream to come up. If the source can't play (offline),
-the channel answers 503 and doesn't retry for `CHANNEL_RETRY_SECONDS` (20). A channel key only ever starts the URL it was saved with,
-so it can be handed to viewers (a game's world state) without the password. Channels are kept in `/data/channels.json`, on a
-named Docker volume.
+`.env` needs one line:
 
 ```sh
-curl -s -X POST localhost:8080/streams -H 'content-type: application/json' \
-  -d '{"password":"…","url":"https://kick.com/somechannel"}'
+RELAY_PASSWORD=your-long-random-password    # make one with: openssl rand -base64 24
 ```
 
-## Stream port (8081)
+All other settings are optional. `.env.example` lists them.
 
-Only `GET /s/<id>/index.m3u8` and `GET /s/<id>/seg_NNNNNN.ts` exist there. The id is 128 random bits, and an unknown id, any other path,
-or a failed stream answers a bare 404. The port never fetches anything on request, so it can't be used to pull arbitrary URLs.
-Anyone who has an id can watch that stream. Hand out play URLs the way you would an unlisted link.
-
-A stream stops by itself when nobody has fetched it for `IDLE_SECONDS` (default 5 min), or when the source ends.
-It stays readable for `KEEP_ENDED_SECONDS` after that, and then its files are deleted.
-
-## Production behind nginx
-
-Keep `BIND_ADDRESS=127.0.0.1` (the default) so only nginx reaches the ports, and set `PUBLIC_STREAM_BASE` to the stream hostname
-so `playUrl` comes back as https.
+The relay listens on `127.0.0.1:8080` (control) and `127.0.0.1:8081` (streams).
+The TV needs both ports behind one HTTPS address. In nginx:
 
 ```nginx
-# control
-server {
-  listen 443 ssl; http2 on;
-  server_name relay-api.example.com;
-  # ssl_certificate …;
-  client_max_body_size 16k;
-  location / {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_read_timeout 120s;          # POST waits for the first segments
-  }
-}
-
-# stream
-server {
-  listen 443 ssl; http2 on;
-  server_name relay.example.com;
-  # ssl_certificate …;
-  location /s/ {
-    proxy_pass http://127.0.0.1:8081;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_buffering on;               # the app already sends the CORS headers; don't add a second copy here
-  }
-  location / { return 404; }
-}
+location /stream/control/ { proxy_pass http://127.0.0.1:8080/; proxy_read_timeout 120s; proxy_set_header X-Forwarded-For $remote_addr; }
+location /stream/relay/   { proxy_pass http://127.0.0.1:8081/; proxy_set_header X-Forwarded-For $remote_addr; }
 ```
 
-The relay trusts `X-Forwarded-For` only from loopback and private addresses (`TRUST_PROXY`), so the lockout counts real client IPs
-behind nginx.
+Then, on the TV, open **TV Settings → Relay**:
 
-## Notes
+- Relay address: `https://your-domain.com/stream`
+- Relay password: the `RELAY_PASSWORD` from `.env`
 
-- Codecs: H.264 sources (Kick, Twitch, most YouTube) are copied without re-encoding. Anything else is transcoded to H.264
-  (`TRANSCODE=auto`), which costs CPU. Audio is always AAC.
-- yt-dlp's generic extractor is off (`ALLOW_GENERIC=false`), so only sites yt-dlp has a dedicated extractor for are accepted. This also
-  keeps the relay from being pointed at internal addresses. Set it to `true` to allow raw `.m3u8`/`.mp4` links and arbitrary pages.
-- Sites change, and yt-dlp keeps up. Rebuild with `docker compose build --no-cache` to pull the newest version.
-- Rebroadcasting someone else's stream may be against that site's terms. This relay is meant for private use behind the password.
+## YouTube
 
-### YouTube
-
-YouTube asks most server IPs to "sign in to confirm you're not a bot". Give yt-dlp a logged-in cookies file (Netscape format,
-exported with a cookies.txt browser extension, ideally from a throwaway Google account) at `/data/cookies.txt` on the volume and restart:
+YouTube blocks most servers. To fix this, export a cookies file from a logged-in browser and copy it in:
 
 ```sh
 docker compose cp cookies.txt relay:/data/cookies.txt && docker compose restart
 ```
 
-Kick and Twitch don't need this. yt-dlp runs YouTube's player JavaScript with the Node.js already in the image (`--js-runtimes node`).
+Kick and Twitch work without cookies.
