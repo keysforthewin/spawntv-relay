@@ -1,0 +1,17 @@
+{
+  "name": "stream-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Password-gated yt-dlp to HLS relay with open CORS on the stream port",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

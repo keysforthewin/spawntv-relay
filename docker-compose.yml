@@ -1,0 +1,20 @@
+services:
+  relay:
+    build:
+      context: .
+      args:
+        YTDLP_VERSION: ${YTDLP_VERSION:-}
+    init: true # reaps yt-dlp/ffmpeg children
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CONTROL_PORT: 8080
+      STREAM_PORT: 8081
+      # The address viewers use for the stream port. Behind nginx: https://relay.example.com
+      PUBLIC_STREAM_BASE: ${PUBLIC_STREAM_BASE:-http://localhost:${STREAM_HOST_PORT:-8081}}
+    ports:
+      # BIND_ADDRESS stays 127.0.0.1 in production so only nginx reaches the ports.
+      - "${BIND_ADDRESS:-127.0.0.1}:${CONTROL_HOST_PORT:-8080}:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:${STREAM_HOST_PORT:-8081}:8081"
+    tmpfs:
+      - /tmp/relay:size=${SEGMENT_RAM:-1g},mode=1777 # segments live in RAM

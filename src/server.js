@@ -1,0 +1,326 @@
+// stream-relay: a password-gated yt-dlp → HLS relay.
+//
+//   control port  POST /streams {password, url}  → { id, playUrl }   (yt-dlp | ffmpeg → rolling HLS on disk)
+//   stream port   GET  /s/<id>/index.m3u8 (+ segments)               (open CORS; only known ids, nothing fetched on demand)
+//
+// One process, two Express apps. The stream id is 128 random bits and is the only key a viewer needs, so a game page
+// can use the play URL as a plain texture address. Without an id nobody can pull anything through the stream port,
+// and only a caller holding the password can make the relay fetch a URL.
+
+import express from "express";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const env = (k, d) => (process.env[k] === undefined || process.env[k] === "" ? d : process.env[k]);
+
+const PASSWORD = env("RELAY_PASSWORD", "");
+if (!PASSWORD) {
+  console.error("RELAY_PASSWORD must be set (see .env.example)");
+  process.exit(1);
+}
+if (PASSWORD.length < 12) console.warn("warning: RELAY_PASSWORD is short; use 12+ random characters in production");
+const CONTROL_PORT = Number(env("CONTROL_PORT", 8080));
+const STREAM_PORT = Number(env("STREAM_PORT", 8081));
+const DATA_DIR = env("DATA_DIR", "/tmp/relay");
+const PUBLIC_STREAM_BASE = env("PUBLIC_STREAM_BASE", `http://localhost:${STREAM_PORT}`).replace(/\/+$/, "");
+const MAX_STREAMS = Number(env("MAX_STREAMS", 4));
+const IDLE_SECONDS = Number(env("IDLE_SECONDS", 300)); // stop a stream nobody has fetched for this long
+const READY_SECONDS = Number(env("READY_SECONDS", 60)); // how long POST waits for the first segments
+const KEEP_ENDED_SECONDS = Number(env("KEEP_ENDED_SECONDS", 120)); // ended streams stay readable this long
+const SEGMENT_SECONDS = Number(env("SEGMENT_SECONDS", 2));
+const LIST_SIZE = Number(env("LIST_SIZE", 8)); // segments in the live window
+const TRANSCODE = env("TRANSCODE", "auto"); // auto: re-encode only non-H.264 video · always · never
+const MAX_HEIGHT = Number(env("MAX_HEIGHT", 1080));
+const ALLOW_GENERIC = env("ALLOW_GENERIC", "false") === "true"; // yt-dlp's generic extractor (any page / raw media URL)
+const TRUST_PROXY = env("TRUST_PROXY", "loopback, uniquelocal");
+
+const FORMAT = env(
+  "YTDLP_FORMAT",
+  [
+    `bv*[vcodec^=avc1][height<=${MAX_HEIGHT}]+ba[acodec^=mp4a]`,
+    `b[vcodec^=avc1][height<=${MAX_HEIGHT}]`,
+    `bv*[height<=${MAX_HEIGHT}]+ba`,
+    `b[height<=${MAX_HEIGHT}]`,
+    "b",
+  ].join("/"),
+);
+const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no-playlist"];
+if (!ALLOW_GENERIC) YTDLP_COMMON.push("--use-extractors", "default,-generic");
+
+// ---------------------------------------------------------------- auth
+
+const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
+const PASSWORD_HASH = sha(PASSWORD);
+const passwordOk = (p) => typeof p === "string" && crypto.timingSafeEqual(sha(p), PASSWORD_HASH);
+
+const failures = new Map(); // ip → { n, until }
+const FAIL_LIMIT = 10, FAIL_WINDOW_MS = 10 * 60_000;
+
+function requirePassword(req, res, next) {
+  const ip = req.ip;
+  const f = failures.get(ip);
+  if (f && f.n >= FAIL_LIMIT && Date.now() < f.until) return res.status(429).json({ error: "too many failed attempts" });
+  const header = req.get("authorization") ?? "";
+  const given = req.body?.password ?? (header.startsWith("Bearer ") ? header.slice(7) : undefined);
+  if (!passwordOk(given)) {
+    const cur = f && Date.now() < f.until ? f : { n: 0, until: Date.now() + FAIL_WINDOW_MS };
+    cur.n++;
+    failures.set(ip, cur);
+    return res.status(401).json({ error: "bad password" });
+  }
+  failures.delete(ip);
+  next();
+}
+
+// ---------------------------------------------------------------- streams
+
+/** @type {Map<string, any>} */
+const streams = new Map();
+const ID_RE = /^[A-Za-z0-9_-]{22}$/;
+const FILE_RE = /^(index\.m3u8|seg_\d{6}\.ts)$/;
+
+const newId = () => crypto.randomBytes(16).toString("base64url");
+const playUrl = (s) => `${PUBLIC_STREAM_BASE}/s/${s.id}/index.m3u8`;
+const tail = (buf) => buf.trim().split("\n").filter(Boolean).slice(-3).join(" | ").slice(0, 600);
+const active = (s) => s.status === "starting" || s.status === "live";
+const log = (s, ...a) => console.log(new Date().toISOString(), s ? `[${s.id.slice(0, 6)}]` : "", ...a);
+
+function publicView(s) {
+  const now = Date.now();
+  for (const [ip, t] of s.viewers) if (now - t > 30_000) s.viewers.delete(ip);
+  return {
+    id: s.id,
+    url: s.url,
+    title: s.title,
+    isLive: s.isLive,
+    status: s.status,
+    error: s.error ?? undefined,
+    transcoding: s.transcode,
+    viewers: s.viewers.size,
+    createdAt: new Date(s.createdAt).toISOString(),
+    lastFetchAt: new Date(s.lastSeen).toISOString(),
+    playUrl: playUrl(s),
+  };
+}
+
+function run(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    const t = setTimeout(() => p.kill("SIGKILL"), timeoutMs);
+    p.on("close", (code) => { clearTimeout(t); resolve({ code, out, err }); });
+    p.on("error", (e) => { clearTimeout(t); resolve({ code: -1, out, err: String(e) }); });
+  });
+}
+
+async function probe(url) {
+  const r = await run("yt-dlp", [...YTDLP_COMMON, "-J", "-f", FORMAT, "--", url], 90_000);
+  if (r.code !== 0) throw new Error(tail(r.err) || "yt-dlp could not read that URL");
+  const info = JSON.parse(r.out);
+  const fmts = info.requested_formats ?? [info];
+  const pick = (k) => fmts.map((f) => f[k]).find((c) => c && c !== "none") ?? "none";
+  return { title: info.title ?? null, isLive: info.is_live === true, vcodec: pick("vcodec"), acodec: pick("acodec") };
+}
+
+function killGroup(p) {
+  if (!p || p.exitCode !== null || p.signalCode !== null) return;
+  try { process.kill(-p.pid, "SIGTERM"); } catch {}
+  setTimeout(() => { try { process.kill(-p.pid, "SIGKILL"); } catch {} }, 5000).unref();
+}
+
+async function startStream(s) {
+  const info = await probe(s.url);
+  if (!active(s)) return; // stopped while probing
+  Object.assign(s, { title: info.title, isLive: info.isLive });
+  if (info.vcodec === "none") throw new Error("that URL has no video track");
+  s.transcode = TRANSCODE === "always" || (TRANSCODE === "auto" && !/^(avc1|h264)/i.test(info.vcodec));
+  await fsp.mkdir(s.dir, { recursive: true });
+
+  const video = s.transcode
+    ? ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+       "-vf", `scale=-2:'min(${MAX_HEIGHT},ih)'`,
+       "-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SECONDS})`]
+    : ["-c:v", "copy"];
+  const ffArgs = [
+    "-hide_banner", "-loglevel", "error",
+    ...(s.isLive ? [] : ["-re"]), // a VOD is paced to real time so it plays like a channel
+    "-i", "pipe:0",
+    "-map", "0:v:0", "-map", "0:a:0?",
+    ...video,
+    "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+    "-f", "hls",
+    "-hls_time", String(SEGMENT_SECONDS),
+    "-hls_list_size", String(LIST_SIZE),
+    "-hls_delete_threshold", "4",
+    "-hls_flags", "delete_segments+independent_segments+temp_file",
+    "-hls_segment_filename", path.join(s.dir, "seg_%06d.ts"),
+    path.join(s.dir, "index.m3u8"),
+  ];
+
+  const yt = spawn("yt-dlp", [...YTDLP_COMMON, "-f", FORMAT, "--no-part", "-o", "-", "--", s.url],
+    { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const ff = spawn("ffmpeg", ffArgs, { stdio: ["pipe", "ignore", "pipe"], detached: true });
+  s.procs = [yt, ff];
+  let ytErr = "", ffErr = "";
+  yt.stderr.on("data", (d) => (ytErr = (ytErr + d).slice(-4000)));
+  ff.stderr.on("data", (d) => (ffErr = (ffErr + d).slice(-4000)));
+  ff.stdin.on("error", () => {}); // EPIPE when ffmpeg goes first
+  yt.stdout.on("error", () => {});
+  yt.stdout.pipe(ff.stdin);
+
+  yt.on("close", (code) => {
+    log(s, `yt-dlp exited ${code}`);
+    if (code && active(s)) s.error = tail(ytErr) || `yt-dlp exited ${code}`;
+  });
+  ff.on("close", (code) => {
+    log(s, `ffmpeg exited ${code}`);
+    killGroup(yt);
+    if (!active(s)) return;
+    if (s.status === "starting") {
+      s.status = "failed";
+      s.error = s.error ?? (tail(ffErr) || "the stream produced no video");
+    } else s.status = "ended";
+    scheduleCleanup(s);
+  });
+
+  log(s, `started ${s.isLive ? "live" : "vod"} ${info.vcodec}/${info.acodec}${s.transcode ? " (transcoding)" : ""}: ${s.title}`);
+  const playlist = path.join(s.dir, "index.m3u8");
+  const deadline = Date.now() + READY_SECONDS * 1000;
+  while (s.status === "starting" && Date.now() < deadline) {
+    if (fs.existsSync(playlist)) { s.status = "live"; s.lastSeen = Date.now(); log(s, "ready", playUrl(s)); return; }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  if (s.status === "starting") throw new Error(`no video after ${READY_SECONDS}s`);
+}
+
+function stopStream(s, why) {
+  if (active(s)) { s.status = why === "failed" ? "failed" : "ended"; log(s, `stopping (${why})`); }
+  for (const p of s.procs ?? []) killGroup(p);
+  scheduleCleanup(s);
+}
+
+function scheduleCleanup(s) {
+  if (s.cleanup) return;
+  s.cleanup = setTimeout(async () => {
+    streams.delete(s.id);
+    await fsp.rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    log(s, "removed");
+  }, KEEP_ENDED_SECONDS * 1000);
+  s.cleanup.unref();
+}
+
+// Idle reaper: nobody fetched the playlist or a segment for IDLE_SECONDS → stop it.
+setInterval(() => {
+  const now = Date.now();
+  for (const s of streams.values()) if (active(s) && now - s.lastSeen > IDLE_SECONDS * 1000) stopStream(s, "idle");
+}, 15_000).unref();
+
+// ---------------------------------------------------------------- control app (password)
+
+const control = express();
+control.disable("x-powered-by");
+control.set("trust proxy", TRUST_PROXY);
+control.use(express.json({ limit: "16kb" }));
+
+control.get("/healthz", (_req, res) => res.json({ ok: true, streams: [...streams.values()].filter(active).length }));
+
+control.post("/streams", requirePassword, async (req, res) => {
+  const raw = req.body?.url;
+  let url;
+  try { url = new URL(String(raw ?? "")); } catch { return res.status(400).json({ error: "url must be an http(s) URL" }); }
+  if (!/^https?:$/.test(url.protocol) || url.href.length > 2048) return res.status(400).json({ error: "url must be an http(s) URL" });
+
+  // Same URL already running → share it (two viewers, one relay).
+  for (const s of streams.values()) if (s.url === url.href && active(s)) return res.status(200).json({ ...publicView(s), reused: true });
+  if ([...streams.values()].filter(active).length >= MAX_STREAMS)
+    return res.status(503).json({ error: `already relaying ${MAX_STREAMS} streams; DELETE one first` });
+
+  const id = newId();
+  const s = { id, url: url.href, title: null, isLive: null, status: "starting", createdAt: Date.now(), lastSeen: Date.now(),
+              dir: path.join(DATA_DIR, id), viewers: new Map(), procs: [], transcode: false };
+  streams.set(id, s);
+  log(s, `requested ${url.href} from ${req.ip}`);
+
+  const started = startStream(s).catch((e) => {
+    s.error = s.error ?? e.message;
+    stopStream(s, "failed");
+    log(s, "failed:", s.error);
+  });
+  if (req.body?.wait === false) return res.status(202).json(publicView(s));
+  await started;
+  if (s.status === "live") return res.status(201).json(publicView(s));
+  return res.status(502).json({ ...publicView(s), error: s.error ?? "stream failed" });
+});
+
+control.get("/streams", requirePassword, (_req, res) => res.json([...streams.values()].map(publicView)));
+
+control.get("/streams/:id", requirePassword, (req, res) => {
+  const s = streams.get(req.params.id);
+  return s ? res.json(publicView(s)) : res.status(404).json({ error: "no such stream" });
+});
+
+control.delete("/streams/:id", requirePassword, (req, res) => {
+  const s = streams.get(req.params.id);
+  if (!s) return res.status(404).json({ error: "no such stream" });
+  stopStream(s, "deleted");
+  return res.json(publicView(s));
+});
+
+control.use((_req, res) => res.status(404).json({ error: "not found" }));
+
+// ---------------------------------------------------------------- stream app (open CORS, id-gated)
+
+const stream = express();
+stream.disable("x-powered-by");
+stream.disable("etag");
+stream.set("trust proxy", TRUST_PROXY);
+stream.use((req, res, next) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Range, Content-Type",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+    "Access-Control-Allow-Private-Network": "true",
+    "Cross-Origin-Resource-Policy": "cross-origin",
+    "Timing-Allow-Origin": "*",
+  });
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+stream.get("/s/:id/:file", (req, res) => {
+  const { id, file } = req.params;
+  const s = ID_RE.test(id) && FILE_RE.test(file) ? streams.get(id) : undefined;
+  if (!s || s.status === "failed") return res.status(404).end();
+  s.lastSeen = Date.now();
+  s.viewers.set(req.ip, s.lastSeen);
+  const isPlaylist = file.endsWith(".m3u8");
+  res.set({
+    "Content-Type": isPlaylist ? "application/vnd.apple.mpegurl" : "video/mp2t",
+    "Cache-Control": isPlaylist ? "no-cache, no-store" : "public, max-age=60",
+  });
+  res.sendFile(path.join(s.dir, file), { dotfiles: "deny", lastModified: false, cacheControl: false }, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
+stream.use((_req, res) => res.status(404).end());
+
+// ---------------------------------------------------------------- boot
+
+await fsp.mkdir(DATA_DIR, { recursive: true });
+for (const leftover of await fsp.readdir(DATA_DIR)) await fsp.rm(path.join(DATA_DIR, leftover), { recursive: true, force: true });
+control.listen(CONTROL_PORT, () => log(null, `control on :${CONTROL_PORT}`));
+stream.listen(STREAM_PORT, () => log(null, `stream on :${STREAM_PORT} → ${PUBLIC_STREAM_BASE}`));
+
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    for (const s of streams.values()) for (const p of s.procs ?? []) killGroup(p);
+    setTimeout(() => process.exit(0), 300);
+  });
+}
