@@ -171,7 +171,7 @@ async function lookUpStreamer(c, hint) {
   if (!c.named) c.name = String(m.name || m.slug || c.name).slice(0, 60);
   return true;
 }
-const streamerStale = (c) => !c.streamerAt || Date.now() - c.streamerAt > STREAMER_REFRESH_DAYS * 86_400_000;
+const streamerStale = (c) => !c.video && (!c.streamerAt || Date.now() - c.streamerAt > STREAMER_REFRESH_DAYS * 86_400_000);
 const streamOfChannel = (key) => {
   let best;
   for (const s of streams.values()) if (s.channel === key && (!best || s.createdAt > best.createdAt)) best = s;
@@ -371,7 +371,8 @@ control.post("/streams", requirePassword, async (req, res) => {
 });
 
 // Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl, platform, slug, streamer, avatarUrl }. The same URL
-// saved twice is one channel. Its name is the streamer's (Kick, Twitch, YouTube), else the given name, else the stream title.
+// saved twice is one channel. Its name is the given name, else the streamer's (Kick, Twitch, a live YouTube), else the title
+// (a YouTube video that isn't live keeps its title: `video: true`, no picture).
 // The URL is checked with yt-dlp first; one that can't play right now (a channel that is offline) is still saved, with `warning`.
 control.post("/channels", requirePassword, async (req, res) => {
   const url = parseUrl(req.body?.url);
@@ -388,7 +389,11 @@ control.post("/channels", requirePassword, async (req, res) => {
   try { info = await probe(url); } catch (e) { warning = `saved, but it doesn't play right now: ${e.message}`; }
   const c = { key: newId(), url, name: name || info?.title?.slice(0, 60) || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
   if (name) c.named = true;
-  await lookUpStreamer(c, info?.channelUrl);
+  // A YouTube video that isn't live keeps its video's title and has no streamer picture; a live one (or a channel link) is
+  // named after its creator, like Kick and Twitch.
+  const host = new URL(url).hostname.replace(/^(www|m)\./, "");
+  if (info && !info.isLive && (host === "youtube.com" || host === "youtu.be")) Object.assign(c, { platform: "youtube", video: true });
+  else await lookUpStreamer(c, info?.channelUrl);
   channels.set(c.key, c);
   await saveChannels();
   log(null, `channel ${c.key.slice(0, 6)} saved: ${c.name} ← ${url} (from ${req.ip})`);
