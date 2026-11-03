@@ -347,6 +347,28 @@ control.post("/channels", requirePassword, async (req, res) => {
   return res.status(201).json({ ...channelView(c), warning });
 });
 
+// Is this a Spawn account? { exists, name, kind: "person" | "agent" | null }. Spawn has no public user search; a person's profile
+// lives at spawn.co/@name and an agent's at spawn.co/@@name, so the answer is whether either page exists. Cached 10 minutes.
+const spawnUsers = new Map();
+control.get("/spawn-user/:name", requirePassword, async (req, res) => {
+  const name = String(req.params.name ?? "").replace(/^@+/, "").trim().toLowerCase();
+  if (!/^[a-z0-9_]{1,40}$/.test(name)) return res.status(400).json({ error: "a Spawn username is letters, digits and _" });
+  const hit = spawnUsers.get(name);
+  if (hit && Date.now() - hit.at < 600_000) return res.json(hit.v);
+  const status = async (prefix) => {
+    const r = await fetch(`https://www.spawn.co/${prefix}${encodeURIComponent(name)}`, { redirect: "manual", headers: { "user-agent": "stream-relay" }, signal: AbortSignal.timeout(8000) });
+    return r.status;
+  };
+  try {
+    const [person, agent] = await Promise.all([status("@"), status("@@")]);
+    const v = { name, exists: person === 200 || agent === 200, kind: person === 200 ? "person" : agent === 200 ? "agent" : null };
+    spawnUsers.set(name, { at: Date.now(), v });
+    return res.json(v);
+  } catch {
+    return res.status(502).json({ error: "couldn't reach spawn.co to check" });
+  }
+});
+
 control.get("/channels", requirePassword, (_req, res) => res.json([...channels.values()].map(channelView)));
 
 control.delete("/channels/:key", requirePassword, async (req, res) => {

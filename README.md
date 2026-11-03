@@ -34,6 +34,7 @@ Ten wrong passwords from one IP lock that IP out for 10 minutes.
 | `POST /channels` | `{ password, url, name? }` | saves the URL as a **channel** with a permanent key: `{ key, name, url, playUrl: …/c/<key>/index.m3u8 }`. Saving the same URL twice gives back the same channel. The URL is checked with yt-dlp first; one that can't play right now (an offline channel) is still saved, with a `warning`. |
 | `GET /channels` | – | every saved channel and whether it is running |
 | `DELETE /channels/:key` | – | forgets the channel and stops its stream |
+| `GET /spawn-user/:name` | – | `{ exists, name, kind: "person" \| "agent" \| null }`: whether `spawn.co/@name` (a person) or `spawn.co/@@name` (an agent) exists. Spawn has no public user search, so this only confirms a name. Cached 10 minutes. |
 | `GET /healthz` | – | no password needed |
 
 The control API sends `Access-Control-Allow-Origin: *`, so a browser page (a game's menu) can call it directly. The person typing
