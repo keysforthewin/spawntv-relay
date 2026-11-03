@@ -91,7 +91,10 @@ function requirePassword(req, res, next) {
 /** @type {Map<string, any>} */
 const streams = new Map();
 const ID_RE = /^[A-Za-z0-9_-]{22}$/;
-const FILE_RE = /^(index\.m3u8|seg_\d{6}\.ts)$/;
+// Segments are numbered from the Unix time their stream started (hls_start_number_source epoch), so a channel's restart never
+// reuses a segment address: a cache anywhere between here and the player (Spawn's texture fetcher included) can't hand back
+// an earlier run's picture under the same name, and the playlist's media sequence only ever counts up.
+const FILE_RE = /^(index\.m3u8|seg_\d{6,12}\.ts)$/;
 
 const newId = () => crypto.randomBytes(16).toString("base64url");
 const playUrl = (s) => (s.channel ? channelUrl(s.channel) : `${PUBLIC_STREAM_BASE}/s/${s.id}/index.m3u8`);
@@ -240,6 +243,7 @@ async function startStream(s) {
     "-f", "hls",
     "-hls_time", String(SEGMENT_SECONDS),
     "-hls_list_size", String(LIST_SIZE),
+    "-hls_start_number_source", "epoch",
     "-hls_delete_threshold", "4",
     "-hls_flags", "delete_segments+independent_segments+temp_file",
     "-hls_segment_filename", path.join(s.dir, "seg_%06d.ts"),
