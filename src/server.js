@@ -45,16 +45,18 @@ const CHANNELS_FILE = env("CHANNELS_FILE", "/data/channels.json"); // saved chan
 const CHANNEL_WAIT_SECONDS = Number(env("CHANNEL_WAIT_SECONDS", 25)); // a channel's first playlist fetch waits this long for its start
 const CHANNEL_RETRY_SECONDS = Number(env("CHANNEL_RETRY_SECONDS", 20)); // after a failed start (channel offline), wait before trying again
 
-const FORMAT = env(
-  "YTDLP_FORMAT",
-  [
-    `bv*[vcodec^=avc1][height<=${MAX_HEIGHT}]+ba[acodec^=mp4a]`,
-    `b[vcodec^=avc1][height<=${MAX_HEIGHT}]`,
-    `bv*[height<=${MAX_HEIGHT}]+ba`,
-    `b[height<=${MAX_HEIGHT}]`,
-    "b",
-  ].join("/"),
-);
+const formatFor = (h, fps) => {
+  const cap = `[height<=${h}]` + (fps ? `[fps<=${fps}]` : "");
+  return [`bv*[vcodec^=avc1]${cap}+ba[acodec^=mp4a]`, `b[vcodec^=avc1]${cap}`, `bv*${cap}+ba`, `b${cap}`, `b[height<=${h}]`, "b"].join("/");
+};
+const FORMAT = env("YTDLP_FORMAT", formatFor(MAX_HEIGHT, 0));
+// YouTube is capped lower than other sites: its 1080p60 picture is more than some players' browsers will decode (their TV stayed
+// blank while Kick played). 720p at 30 fps plays everywhere.
+const YT_MAX_HEIGHT = Number(env("YT_MAX_HEIGHT", 720));
+const YT_MAX_FPS = Number(env("YT_MAX_FPS", 30));
+const YT_FORMAT = env("YTDLP_FORMAT", formatFor(Math.min(MAX_HEIGHT, YT_MAX_HEIGHT), YT_MAX_FPS));
+const isYouTube = (url) => { try { return /(^|\.)(youtube\.com|youtu\.be)$/.test(new URL(url).hostname.toLowerCase()); } catch { return false; } };
+const formatOf = (url) => (isYouTube(url) ? YT_FORMAT : FORMAT);
 // YouTube needs a JavaScript runtime (Node is in the image) and, from a server IP, usually a logged-in cookies file: put one at
 // COOKIES_FILE (Netscape format, e.g. exported with a "cookies.txt" browser extension from a throwaway account) and it is used.
 const COOKIES_FILE = env("COOKIES_FILE", "/data/cookies.txt");
@@ -358,7 +360,7 @@ async function probe(url, tries = 1, keep) {
   let r;
   for (let i = 0; i < tries; i++) {
     if (i) await new Promise((res) => setTimeout(res, 1500));
-    r = await ytdlp(["-J", "-f", FORMAT, "--", url], 90_000);
+    r = await ytdlp(["-J", "-f", formatOf(url), "--", url], 90_000);
     if (r.code === 0) break;
   }
   if (r.code !== 0) throw new Error(tail(r.err) || "yt-dlp could not read that URL");
@@ -505,7 +507,7 @@ async function playItem(s, item, onStart) {
     ];
 
     const ck = await cookieArgs();
-    const yt = spawn("yt-dlp", [...YTDLP_COMMON, ...ck.args, "-f", FORMAT, "--no-part", "-o", "-", "--load-info-json", info.infoFile],
+    const yt = spawn("yt-dlp", [...YTDLP_COMMON, ...ck.args, "-f", formatOf(item.url), "--no-part", "-o", "-", "--load-info-json", info.infoFile],
       { stdio: ["ignore", "pipe", "pipe"], detached: true });
     const ff = spawn("ffmpeg", ffArgs, { stdio: ["pipe", "ignore", "pipe"], detached: true });
     s.procs = [yt, ff];
