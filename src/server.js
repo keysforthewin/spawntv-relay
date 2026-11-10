@@ -484,7 +484,10 @@ async function playItem(s, item, onStart) {
       : ["-c:v", "copy"];
     const ffArgs = [
       "-hide_banner", "-loglevel", "error",
-      ...(s.isLive ? [] : ["-re"]), // a VOD is paced to real time so it plays like a channel
+      // A VOD is paced to real time so it plays like a channel. Its decode timestamps are ignored: in yt-dlp's merged MPEG-TS
+      // a 60 fps picture arrives with some unset, and with the sound re-encoded beside it the HLS muxer then stops cutting
+      // segments after the first two (the video sat at 10 seconds for good).
+      ...(s.isLive ? [] : ["-re", "-fflags", "+igndts"]),
       "-i", "pipe:0",
       "-map", "0:v:0", "-map", "0:a:0?",
       ...video,
