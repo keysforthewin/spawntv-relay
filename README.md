@@ -38,11 +38,18 @@ Then, in game, open **TV Settings → Relay** on the Spawn TV:
 
 ## YouTube
 
-YouTube blocks most servers. To fix this, export a cookies file from a logged-in browser and copy it in:
+YouTube blocks most servers. To fix this, export a cookies file from a logged-in browser and copy it in (no restart needed):
 
 ```sh
-docker compose cp cookies.txt relay:/data/cookies.txt && docker compose restart
+docker compose cp cookies.txt relay:/data/cookies.txt
 ```
+
+What a YouTube link plays:
+
+- a video: that video, on repeat
+- a live stream: the broadcast
+- a playlist (any link with `list=`): its videos in order, then from the top again
+- a channel (`youtube.com/@name`): its live broadcast if there is one, then its newest video, then its other recent videos at random
 
 Kick and Twitch work without cookies.
 

@@ -66,8 +66,21 @@ const clampDelay = (v) => Math.max(-MAX_DELAY_SECONDS, Math.min(MAX_DELAY_SECOND
 const settings = { videoDelay: clampDelay(VIDEO_DELAY_SECONDS) };
 const STREAMER_REFRESH_DAYS = Number(env("STREAMER_REFRESH_DAYS", 7)); // a re-save after this long looks the streamer up again
 const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no-playlist", "--js-runtimes", "node"];
-if (fs.existsSync(COOKIES_FILE)) YTDLP_COMMON.push("--cookies", COOKIES_FILE);
+const PLAYLIST_MAX = Number(env("PLAYLIST_MAX", 200)); // videos read from a YouTube playlist
+const CHANNEL_MAX = Number(env("CHANNEL_MAX", 50)); // a YouTube channel plays from its newest this many videos
 if (!ALLOW_GENERIC) YTDLP_COMMON.push("--use-extractors", "default,-generic");
+
+// The cookies file is looked for on every run, so adding or replacing it needs no restart. Each run gets its own copy: yt-dlp
+// writes the jar back when it exits, and overlapping runs would otherwise write over each other.
+let cookieN = 0;
+async function cookieArgs() {
+  if (!fs.existsSync(COOKIES_FILE)) return { args: [], done: () => {} };
+  const f = path.join(DATA_DIR, `.cookies-${process.pid}-${++cookieN}.txt`);
+  await fsp.mkdir(DATA_DIR, { recursive: true });
+  await fsp.copyFile(COOKIES_FILE, f);
+  await fsp.chmod(f, 0o600);
+  return { args: ["--cookies", f], done: () => fsp.rm(f, { force: true }).catch(() => {}) };
+}
 
 // ---------------------------------------------------------------- auth
 
@@ -136,6 +149,7 @@ function publicView(s) {
 // key can only ever start the URL it was saved with.
 
 /** @type {Map<string, { key: string, url: string, name: string, named?: boolean, platform?: string, slug?: string,
+ *   kind?: "video" | "live" | "playlist" | "channel", pending?: boolean,
  *   streamer?: string, avatar?: string, streamerAt?: number, createdAt: string }>} */
 const channels = new Map();
 async function loadChannels() {
@@ -189,7 +203,85 @@ async function lookUpStreamer(c, hint) {
   if (!c.named) c.name = String(m.name || m.slug || c.name).slice(0, 60);
   return true;
 }
-const streamerStale = (c) => !c.video && (!c.streamerAt || Date.now() - c.streamerAt > STREAMER_REFRESH_DAYS * 86_400_000);
+// What a YouTube link is: "video" (a /watch, youtu.be, /shorts or /live link), "playlist" (anything with list=), "channel"
+// (/@handle, /channel/…, /c/…, /user/…), or null for another site.
+function youtubeKind(raw) {
+  const u = new URL(raw), host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, "");
+  if (host !== "youtube.com" && host !== "youtu.be") return null;
+  if (u.searchParams.get("list")) return "playlist";
+  if (host === "youtu.be") return "video";
+  const p = u.pathname.split("/").filter(Boolean);
+  if (p[0]?.startsWith("@") || ["channel", "c", "user"].includes(p[0])) return p.at(-1) === "live" ? "video" : "channel";
+  return "video";
+}
+// A channel link without its tab: https://www.youtube.com/@handle
+function youtubeChannelBase(raw) {
+  const p = new URL(raw).pathname.split("/").filter(Boolean);
+  return "https://www.youtube.com/" + p.slice(0, p[0].startsWith("@") ? 1 : 2).join("/");
+}
+const watchUrl = (id) => `https://www.youtube.com/watch?v=${id}`;
+
+// A picture for a channel that has no streamer: a video's (or a playlist's first video's) thumbnail, kept beside the avatars.
+const THUMB_EXT = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+async function saveThumb(c, videoId) {
+  if (!/^[A-Za-z0-9_-]{6,20}$/.test(String(videoId ?? ""))) return false;
+  try {
+    const r = await fetch(`https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`, { signal: AbortSignal.timeout(10_000) });
+    const ext = THUMB_EXT[(r.headers.get("content-type") ?? "").split(";")[0].trim()];
+    const body = Buffer.from(await r.arrayBuffer());
+    if (!r.ok || !ext || body.length > 2_000_000) return false;
+    await fsp.mkdir(AVATAR_DIR, { recursive: true });
+    for (const f of await fsp.readdir(AVATAR_DIR)) if (f.startsWith(`${c.key}.`)) await fsp.rm(path.join(AVATAR_DIR, f), { force: true });
+    await fsp.writeFile(path.join(AVATAR_DIR, `${c.key}.${ext}`), body);
+    Object.assign(c, { avatar: `${c.key}.${ext}`, streamerAt: Date.now() });
+    return true;
+  } catch { return false; }
+}
+
+// Name a channel and give it a picture, from what its link is:
+//   a YouTube video      its title and its thumbnail            (kind "video")
+//   a live YouTube video its creator's name and picture         (kind "live"), like Kick and Twitch
+//   a YouTube playlist   the playlist's title, its first video's thumbnail (kind "playlist")
+//   a YouTube channel    the creator's name and picture         (kind "channel")
+// Answers a warning when the link couldn't be read now. A YouTube link that couldn't be read is `pending` and is described
+// again on its next save, at the next boot, and when it first plays.
+async function describe(c) {
+  const yt = youtubeKind(c.url), rename = (n) => { if (!c.named && n) c.name = String(n).slice(0, 60).trim(); };
+  try {
+    if (yt === "playlist") {
+      const l = await listEntries(c.url, 1);
+      rename(l.title);
+      Object.assign(c, { platform: "youtube", kind: "playlist", slug: undefined, streamer: l.channel ?? undefined });
+      await saveThumb(c, l.entries[0]?.id);
+    } else if (yt === "channel") {
+      Object.assign(c, { platform: "youtube", kind: "channel" });
+      if (!(await lookUpStreamer(c)) || !c.streamer) throw new Error("couldn't read that channel's page");
+    } else {
+      const info = await probe(c.url, yt ? 3 : 1);
+      if (yt && !info.isLive) {
+        rename(info.title);
+        Object.assign(c, { platform: "youtube", kind: "video", slug: undefined, streamer: info.channel ?? undefined });
+        await saveThumb(c, info.id);
+      } else {
+        if (!c.streamer) rename(info.title);
+        await lookUpStreamer(c, info.channelUrl);
+        if (yt) c.kind = "live";
+      }
+    }
+    delete c.pending;
+    return undefined;
+  } catch (e) {
+    if (yt) Object.assign(c, { platform: "youtube", pending: true });
+    else await lookUpStreamer(c); // an offline Kick or Twitch channel still has a streamer
+    return `saved, but it doesn't play right now: ${e.message}`;
+  }
+}
+const streamerStale = (c) => !c.streamerAt || Date.now() - c.streamerAt > STREAMER_REFRESH_DAYS * 86_400_000;
+const needsDescribe = (c) => {
+  const yt = youtubeKind(c.url);
+  if (!yt) return streamerStale(c);
+  return c.pending || !c.kind || ((c.kind === "channel" || c.kind === "live") && streamerStale(c));
+};
 const streamOfChannel = (key) => {
   let best;
   for (const s of streams.values()) if (s.channel === key && (!best || s.createdAt > best.createdAt)) best = s;
@@ -240,14 +332,89 @@ function run(cmd, args, timeoutMs) {
   });
 }
 
-async function probe(url) {
-  const r = await run("yt-dlp", [...YTDLP_COMMON, "-J", "-f", FORMAT, "--", url], 90_000);
+async function ytdlp(args, timeoutMs) {
+  const ck = await cookieArgs();
+  try { return await run("yt-dlp", [...YTDLP_COMMON, ...ck.args, ...args], timeoutMs); } finally { ck.done(); }
+}
+
+// Read one video's facts. `tries` > 1 asks again after a refusal (YouTube turns a server away at random). With `keep`, yt-dlp's
+// whole answer is also written to that file, so the download that follows reads it (--load-info-json) instead of asking the
+// site a second time.
+async function probe(url, tries = 1, keep) {
+  let r;
+  for (let i = 0; i < tries; i++) {
+    if (i) await new Promise((res) => setTimeout(res, 1500));
+    r = await ytdlp(["-J", "-f", FORMAT, "--", url], 90_000);
+    if (r.code === 0) break;
+  }
   if (r.code !== 0) throw new Error(tail(r.err) || "yt-dlp could not read that URL");
   const info = JSON.parse(r.out);
+  if (keep) await fsp.writeFile(keep, r.out);
   const fmts = info.requested_formats ?? [info];
   const pick = (k) => fmts.map((f) => f[k]).find((c) => c && c !== "none") ?? "none";
-  return { title: info.title ?? null, isLive: info.is_live === true, vcodec: pick("vcodec"), acodec: pick("acodec"),
-    channelUrl: info.channel_url ?? info.uploader_url ?? null };
+  return { id: info.id ?? null, title: info.title ?? null, isLive: info.is_live === true, vcodec: pick("vcodec"), acodec: pick("acodec"),
+    duration: Number(info.duration) || null, channel: info.channel ?? info.uploader ?? null,
+    channelUrl: info.channel_url ?? info.uploader_url ?? null, infoFile: keep ?? null };
+}
+
+// The videos of a YouTube playlist or channel tab, in the site's order (a channel's newest first): { title, channel, entries: [{ id, title }] }.
+async function listEntries(url, max) {
+  let r;
+  for (let i = 0; i < 3; i++) {
+    if (i) await new Promise((res) => setTimeout(res, 1500));
+    r = await ytdlp(["--yes-playlist", "--flat-playlist", "--playlist-end", String(max), "-J", "--", url], 90_000);
+    if (r.code === 0) break;
+  }
+  if (r.code !== 0) throw new Error(tail(r.err) || "yt-dlp could not read that list");
+  const info = JSON.parse(r.out);
+  const entries = (info.entries ?? []).filter((e) => e && /^[A-Za-z0-9_-]{6,20}$/.test(String(e.id ?? "")) && e.live_status !== "is_upcoming")
+    .map((e) => ({ id: e.id, title: e.title ?? null }));
+  if (!entries.length) throw new Error("that list has no videos");
+  return { title: info.title ?? null, channel: info.channel ?? info.uploader ?? null, entries };
+}
+
+// What a stream plays, one item after another: next() answers { url, info? } or null when there is nothing more.
+//   a YouTube playlist  its videos in order, then from the top again; a channel's place in it is remembered while the relay runs
+//   a YouTube channel   its live broadcast when it has one, then its newest video, then its other recent videos in random order
+//   a YouTube video     over and over (a live one once)
+//   anything else       once, as before (a Kick or Twitch broadcast)
+const cursors = new Map(); // channel key → index of the playlist video that is playing
+async function makeQueue(s) {
+  const yt = youtubeKind(s.url);
+  if (yt === "playlist") {
+    let list = await listEntries(s.url, PLAYLIST_MAX);
+    const v = new URL(s.url).searchParams.get("v"); // a /watch link inside a playlist starts at that video
+    let i = s.channel && cursors.has(s.channel) ? cursors.get(s.channel) : Math.max(0, list.entries.findIndex((e) => e.id === v));
+    return { loops: true, maxFails: 5, next: async () => {
+      if (i >= list.entries.length) { i = 0; list = await listEntries(s.url, PLAYLIST_MAX).catch(() => list); }
+      if (s.channel) cursors.set(s.channel, i);
+      return { url: watchUrl(list.entries[i++].id) };
+    } };
+  }
+  if (yt === "channel") {
+    const base = youtubeChannelBase(s.url);
+    const recent = async () => (await listEntries(`${base}/videos`, CHANNEL_MAX).catch(() => listEntries(`${base}/streams`, CHANNEL_MAX))).entries.map((e) => e.id);
+    const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+    let ids = null, first = true, last = null;
+    return { loops: true, maxFails: 5, next: async () => {
+      if (first) {
+        first = false;
+        const live = await probe(`${base}/live`, 1, path.join(DATA_DIR, `.info-${newId()}.json`)).catch(() => null);
+        if (live?.isLive) return { url: `${base}/live`, info: live };
+        if (live?.infoFile) fsp.rm(live.infoFile, { force: true }).catch(() => {});
+      }
+      if (!ids) { const all = await recent(); ids = [all[0], ...shuffle(all.slice(1))]; }
+      else if (!ids.length) { ids = shuffle(await recent()); if (ids.length > 1 && ids[0] === last) ids.push(ids.shift()); }
+      last = ids.shift();
+      return { url: watchUrl(last) };
+    } };
+  }
+  if (yt === "video") {
+    let done = false;
+    return { loops: true, maxFails: 2, next: async () => (done ? null : { url: s.url, after: (info) => { done = info.isLive; } }) };
+  }
+  let given = false;
+  return { loops: false, maxFails: 1, next: async () => (given ? null : ((given = true), { url: s.url })) };
 }
 
 function killGroup(p) {
@@ -267,65 +434,131 @@ function delayArgs(s) {
   return ["-af", d > 0 ? `asetpts=PTS-(${d})/TB,atrim=start=0` : `adelay=${Math.round(-d * 1000)}:all=1`];
 }
 
+// Old segments of earlier items: ffmpeg only deletes the ones written by its own run, so the ones the playlist has moved past
+// are removed here before each new item.
+async function sweepSegments(s) {
+  try {
+    const seq = Number((await fsp.readFile(path.join(s.dir, "index.m3u8"), "utf8")).match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1]);
+    if (!Number.isFinite(seq)) return;
+    for (const f of await fsp.readdir(s.dir)) {
+      const n = Number(f.match(/^seg_(\d+)\.ts$/)?.[1]);
+      if (Number.isFinite(n) && n < seq - 4) await fsp.rm(path.join(s.dir, f), { force: true });
+    }
+  } catch {}
+}
+
+// Play one item into the stream's playlist; answers true when it played through to its end. The first item starts the playlist;
+// each later one is appended to it after a discontinuity mark, so a player keeps reading the same address through a whole
+// playlist. `onStart(info)` is called once yt-dlp and ffmpeg are running.
+async function playItem(s, item, onStart) {
+  const info = item.info ?? await probe(item.url, s.queue.loops ? 2 : 1, path.join(DATA_DIR, `.info-${newId()}.json`));
+  try {
+    if (!active(s)) return false; // stopped while probing
+    if (info.vcodec === "none") throw new Error("that URL has no video track");
+    Object.assign(s, { title: info.title, isLive: info.isLive });
+    item.after?.(info);
+    s.videoDelay = settings.videoDelay; // fixed for this run of ffmpeg; a change restarts the stream
+    s.transcode = TRANSCODE === "always" || (TRANSCODE === "auto" && !/^(avc1|h264)/i.test(info.vcodec));
+    const playlist = path.join(s.dir, "index.m3u8");
+    const append = fs.existsSync(playlist);
+    if (append) await sweepSegments(s);
+
+    const video = s.transcode
+      ? ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+         "-vf", `scale=-2:'min(${MAX_HEIGHT},ih)'`,
+         "-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SECONDS})`]
+      : ["-c:v", "copy"];
+    const ffArgs = [
+      "-hide_banner", "-loglevel", "error",
+      ...(s.isLive ? [] : ["-re"]), // a VOD is paced to real time so it plays like a channel
+      "-i", "pipe:0",
+      "-map", "0:v:0", "-map", "0:a:0?",
+      ...video,
+      "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+      ...delayArgs(s),
+      "-f", "hls",
+      "-hls_time", String(SEGMENT_SECONDS),
+      "-hls_list_size", String(LIST_SIZE),
+      // The first item numbers its segments from the clock; an appended item carries on from the playlist's own count.
+      ...(append ? [] : ["-hls_start_number_source", "epoch"]),
+      "-hls_delete_threshold", "4",
+      "-hls_flags", "delete_segments+independent_segments+temp_file" + (s.queue.loops ? "+omit_endlist" : "") + (append ? "+append_list+discont_start" : ""),
+      "-hls_segment_filename", path.join(s.dir, "seg_%06d.ts"),
+      playlist,
+    ];
+
+    const ck = await cookieArgs();
+    const yt = spawn("yt-dlp", [...YTDLP_COMMON, ...ck.args, "-f", FORMAT, "--no-part", "-o", "-", "--load-info-json", info.infoFile],
+      { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const ff = spawn("ffmpeg", ffArgs, { stdio: ["pipe", "ignore", "pipe"], detached: true });
+    s.procs = [yt, ff];
+    let ytErr = "", ffErr = "";
+    yt.stderr.on("data", (d) => (ytErr = (ytErr + d).slice(-4000)));
+    ff.stderr.on("data", (d) => (ffErr = (ffErr + d).slice(-4000)));
+    ff.stdin.on("error", () => {}); // EPIPE when ffmpeg goes first
+    yt.stdout.on("error", () => {});
+    yt.stdout.pipe(ff.stdin);
+    const closed = (p) => new Promise((res) => { p.on("close", (code) => res(code)); p.on("error", () => res(-1)); });
+    const ytDone = closed(yt), ffDone = closed(ff);
+    ffDone.then(() => killGroup(yt));
+    log(s, `started ${s.isLive ? "live" : "vod"} ${info.vcodec}/${info.acodec}${s.transcode ? " (transcoding)" : ""}${s.videoDelay ? `, video delay ${s.videoDelay}s` : ""}: ${s.title}`);
+    onStart?.(info);
+
+    const [ytCode, ffCode] = await Promise.all([ytDone, ffDone]);
+    ck.done();
+    log(s, `yt-dlp exited ${ytCode}, ffmpeg exited ${ffCode}`);
+    if (!active(s)) return false;
+    if (ytCode) throw new Error(tail(ytErr) || `yt-dlp exited ${ytCode}`);
+    if (ffCode) throw new Error(tail(ffErr) || "the stream produced no video");
+    return true;
+  } finally {
+    if (info.infoFile) fsp.rm(info.infoFile, { force: true }).catch(() => {});
+  }
+}
+
+// Play the stream's items one after another until it is stopped, runs out, or too many in a row fail.
+async function playLoop(s) {
+  let fails = 0, nextP = null, timer = null;
+  const fetchNext = async () => {
+    const item = await s.queue.next();
+    if (item && !item.info) item.info = await probe(item.url, 2, path.join(DATA_DIR, `.info-${newId()}.json`)).catch(() => undefined);
+    return item;
+  };
+  // The next item is read shortly before this one ends, so the gap between two videos is only ffmpeg's start.
+  const onStart = (info) => {
+    const c = s.channel && channels.get(s.channel);
+    if (c?.pending) describe(c).then(saveChannels).catch(() => {});
+    if (!s.queue.loops || info.isLive || !info.duration) return;
+    timer = setTimeout(() => { if (active(s)) nextP = fetchNext().catch(() => null); }, Math.max(0, info.duration - 90) * 1000);
+    timer.unref();
+  };
+  const end = (status) => {
+    if (active(s)) { s.status = s.status === "starting" ? "failed" : status; scheduleCleanup(s); }
+  };
+  while (active(s)) {
+    let item;
+    try { item = nextP ? ((await nextP) ?? (await fetchNext())) : await s.queue.next(); }
+    catch (e) { s.error = e.message; item = undefined; }
+    nextP = null;
+    if (!active(s)) break;
+    if (item === null) return end("ended");
+    let ok = false;
+    if (item) {
+      try { ok = await playItem(s, item, onStart); }
+      catch (e) { s.error = e.message; if (active(s)) log(s, `item failed (${item.url}): ${e.message}`); }
+    }
+    clearTimeout(timer);
+    if (ok) { fails = 0; s.error = undefined; }
+    else if (active(s) && ++fails >= s.queue.maxFails) return end("ended"); // "failed" when nothing ever played
+  }
+  if (nextP) nextP.then((it) => it?.info?.infoFile && fsp.rm(it.info.infoFile, { force: true })).catch(() => {});
+}
+
 async function startStream(s) {
-  const info = await probe(s.url);
-  if (!active(s)) return; // stopped while probing
-  Object.assign(s, { title: info.title, isLive: info.isLive });
-  if (info.vcodec === "none") throw new Error("that URL has no video track");
-  s.videoDelay = settings.videoDelay; // fixed for this run of ffmpeg; a change restarts the stream
-  s.transcode = TRANSCODE === "always" || (TRANSCODE === "auto" && !/^(avc1|h264)/i.test(info.vcodec));
+  s.queue = await makeQueue(s);
+  if (!active(s)) return;
   await fsp.mkdir(s.dir, { recursive: true });
-
-  const video = s.transcode
-    ? ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
-       "-vf", `scale=-2:'min(${MAX_HEIGHT},ih)'`,
-       "-force_key_frames", `expr:gte(t,n_forced*${SEGMENT_SECONDS})`]
-    : ["-c:v", "copy"];
-  const ffArgs = [
-    "-hide_banner", "-loglevel", "error",
-    ...(s.isLive ? [] : ["-re"]), // a VOD is paced to real time so it plays like a channel
-    "-i", "pipe:0",
-    "-map", "0:v:0", "-map", "0:a:0?",
-    ...video,
-    "-c:a", "aac", "-b:a", "160k", "-ac", "2",
-    ...delayArgs(s),
-    "-f", "hls",
-    "-hls_time", String(SEGMENT_SECONDS),
-    "-hls_list_size", String(LIST_SIZE),
-    "-hls_start_number_source", "epoch",
-    "-hls_delete_threshold", "4",
-    "-hls_flags", "delete_segments+independent_segments+temp_file",
-    "-hls_segment_filename", path.join(s.dir, "seg_%06d.ts"),
-    path.join(s.dir, "index.m3u8"),
-  ];
-
-  const yt = spawn("yt-dlp", [...YTDLP_COMMON, "-f", FORMAT, "--no-part", "-o", "-", "--", s.url],
-    { stdio: ["ignore", "pipe", "pipe"], detached: true });
-  const ff = spawn("ffmpeg", ffArgs, { stdio: ["pipe", "ignore", "pipe"], detached: true });
-  s.procs = [yt, ff];
-  let ytErr = "", ffErr = "";
-  yt.stderr.on("data", (d) => (ytErr = (ytErr + d).slice(-4000)));
-  ff.stderr.on("data", (d) => (ffErr = (ffErr + d).slice(-4000)));
-  ff.stdin.on("error", () => {}); // EPIPE when ffmpeg goes first
-  yt.stdout.on("error", () => {});
-  yt.stdout.pipe(ff.stdin);
-
-  yt.on("close", (code) => {
-    log(s, `yt-dlp exited ${code}`);
-    if (code && active(s)) s.error = tail(ytErr) || `yt-dlp exited ${code}`;
-  });
-  ff.on("close", (code) => {
-    log(s, `ffmpeg exited ${code}`);
-    killGroup(yt);
-    if (!active(s)) return;
-    if (s.status === "starting") {
-      s.status = "failed";
-      s.error = s.error ?? (tail(ffErr) || "the stream produced no video");
-    } else s.status = "ended";
-    scheduleCleanup(s);
-  });
-
-  log(s, `started ${s.isLive ? "live" : "vod"} ${info.vcodec}/${info.acodec}${s.transcode ? " (transcoding)" : ""}${s.videoDelay ? `, video delay ${s.videoDelay}s` : ""}: ${s.title}`);
+  playLoop(s).catch((e) => { s.error = s.error ?? e.message; stopStream(s, "failed"); });
   const playlist = path.join(s.dir, "index.m3u8");
   const deadline = Date.now() + READY_SECONDS * 1000;
   while (s.status === "starting" && Date.now() < deadline) {
@@ -333,6 +566,7 @@ async function startStream(s) {
     await new Promise((r) => setTimeout(r, 400));
   }
   if (s.status === "starting") throw new Error(`no video after ${READY_SECONDS}s`);
+  if (s.status === "failed") throw new Error(s.error ?? "the stream failed");
 }
 
 function stopStream(s, why) {
@@ -393,30 +627,24 @@ control.post("/streams", requirePassword, async (req, res) => {
   return res.status(502).json({ ...publicView(s), error: s.error ?? "stream failed" });
 });
 
-// Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl, platform, slug, streamer, avatarUrl }. The same URL
-// saved twice is one channel. Its name is the given name, else the streamer's (Kick, Twitch, a live YouTube), else the title
-// (a YouTube video that isn't live keeps its title: `video: true`, no picture).
-// The URL is checked with yt-dlp first; one that can't play right now (a channel that is offline) is still saved, with `warning`.
+// Save a URL as a channel: { password, url, name? } → { key, name, url, playUrl, platform, kind, slug, streamer, avatarUrl }. The same
+// URL saved twice is one channel. Its name is the given name, else what describe() finds: the streamer (Kick, Twitch, a live
+// YouTube, a YouTube channel), a YouTube video's title, a playlist's title.
+// A link that can't be read right now (a channel that is offline) is still saved, with `warning`.
 control.post("/channels", requirePassword, async (req, res) => {
   const url = parseUrl(req.body?.url);
   if (!url) return res.status(400).json({ error: "url must be an http(s) URL" });
   const name = String(req.body?.name ?? "").trim().slice(0, 60);
   for (const c of channels.values()) if (c.url === url) {
-    let changed = false;
+    let changed = false, warning;
     if (name && name !== c.name) { Object.assign(c, { name, named: true }); changed = true; }
-    if (streamerStale(c)) changed = (await lookUpStreamer(c)) || changed;
+    if (needsDescribe(c)) { warning = await describe(c); changed = true; }
     if (changed) await saveChannels();
-    return res.json({ ...channelView(c), reused: true });
+    return res.json({ ...channelView(c), reused: true, warning });
   }
-  let info = null, warning;
-  try { info = await probe(url); } catch (e) { warning = `saved, but it doesn't play right now: ${e.message}`; }
-  const c = { key: newId(), url, name: name || info?.title?.slice(0, 60) || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
+  const c = { key: newId(), url, name: name || new URL(url).host + new URL(url).pathname, createdAt: new Date().toISOString() };
   if (name) c.named = true;
-  // A YouTube video that isn't live keeps its video's title and has no streamer picture; a live one (or a channel link) is
-  // named after its creator, like Kick and Twitch.
-  const host = new URL(url).hostname.replace(/^(www|m)\./, "");
-  if (info && !info.isLive && (host === "youtube.com" || host === "youtu.be")) Object.assign(c, { platform: "youtube", video: true });
-  else await lookUpStreamer(c, info?.channelUrl);
+  const warning = await describe(c);
   channels.set(c.key, c);
   await saveChannels();
   log(null, `channel ${c.key.slice(0, 6)} saved: ${c.name} ← ${url} (from ${req.ip})`);
@@ -572,11 +800,11 @@ await loadChannels();
 await loadSettings();
 await fsp.mkdir(DATA_DIR, { recursive: true });
 for (const leftover of await fsp.readdir(DATA_DIR)) await fsp.rm(path.join(DATA_DIR, leftover), { recursive: true, force: true });
-// Channels saved before streamer lookups existed (or long ago) get their streamer in the background, one at a time.
+// Channels whose name and picture are missing or old (needsDescribe) get them in the background, one at a time.
 (async () => {
   let n = 0;
-  for (const c of channels.values()) if (streamerStale(c) && (await lookUpStreamer(c))) n++;
-  if (n) { await saveChannels(); log(null, `looked up the streamer of ${n} channel(s)`); }
+  for (const c of channels.values()) if (needsDescribe(c)) { await describe(c); n++; }
+  if (n) { await saveChannels(); log(null, `described ${n} channel(s) again`); }
 })().catch((e) => console.error("streamer backfill:", e.message));
 control.listen(CONTROL_PORT, () => log(null, `control on :${CONTROL_PORT}`));
 stream.listen(STREAM_PORT, () => log(null, `stream on :${STREAM_PORT} → ${PUBLIC_STREAM_BASE}`));
