@@ -69,6 +69,11 @@ const YTDLP_COMMON = ["--ignore-config", "--no-warnings", "--no-progress", "--no
 const PLAYLIST_MAX = Number(env("PLAYLIST_MAX", 200)); // videos read from a YouTube playlist
 const CHANNEL_MAX = Number(env("CHANNEL_MAX", 50)); // a YouTube channel plays from its newest this many videos
 if (!ALLOW_GENERIC) YTDLP_COMMON.push("--use-extractors", "default,-generic");
+// YouTube wants a "PO token" with most downloads. yt-dlp can't make one itself: the bgutil provider (the `pot` service in
+// docker-compose.yml, with its yt-dlp plugin installed in the image) does, and this is its address.
+const POT_BASE_URL = env("POT_BASE_URL", "");
+if (POT_BASE_URL) YTDLP_COMMON.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`);
+const CHANNEL_RETRY_MAX_SECONDS = Number(env("CHANNEL_RETRY_MAX_SECONDS", 600)); // the wait doubles with each failed start, up to this
 
 // The cookies file is looked for on every run, so adding or replacing it needs no restart. Each run gets its own copy: yt-dlp
 // writes the jar back when it exits, and overlapping runs would otherwise write over each other.
@@ -301,19 +306,28 @@ function createStream(url, channel) {
   const s = { id, url, channel, title: null, isLive: null, status: "starting", createdAt: Date.now(), lastSeen: Date.now(),
               dir: path.join(DATA_DIR, id), viewers: new Map(), procs: [], transcode: false };
   streams.set(id, s);
-  s.started = startStream(s).catch((e) => {
+  s.started = startStream(s).then(() => { if (channel) failStreak.delete(channel); }).catch((e) => {
     s.error = s.error ?? e.message;
     stopStream(s, "failed");
-    log(s, "failed:", s.error);
+    if (channel) failStreak.set(channel, { n: (failStreak.get(channel)?.n ?? 0) + 1, at: Date.now() });
+    log(s, "failed:", s.error, channel ? `(next try in ${retryWait(channel)}s)` : "");
   });
   return s;
 }
 
+// A channel whose start failed waits before its next try, twice as long after each failure in a row (20 s, 40 s, … 10 min):
+// a player asks for the playlist every few seconds, and a site that is refusing us refuses harder when asked that often.
+const failStreak = new Map(); // channel key → { n: failed starts in a row, at: when the last one failed }
+const retryWait = (key) => {
+  const f = failStreak.get(key);
+  return f ? Math.min(CHANNEL_RETRY_MAX_SECONDS, CHANNEL_RETRY_SECONDS * 2 ** (f.n - 1)) : 0;
+};
 // The stream a channel's viewer should read now, starting one when none is running (null: none can start right now).
 function channelStream(c) {
   const s = streamOfChannel(c.key);
   if (s && active(s)) return s;
-  if (s?.status === "failed" && Date.now() - s.createdAt < CHANNEL_RETRY_SECONDS * 1000) return null;
+  const f = failStreak.get(c.key);
+  if (f && Date.now() - f.at < retryWait(c.key) * 1000) return null;
   if (activeCount() >= MAX_STREAMS) return null;
   const n = createStream(c.url, c.key);
   log(n, `channel ${c.key.slice(0, 6)} (${c.name}) starting for a viewer`);

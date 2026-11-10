@@ -8,6 +8,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 ARG YTDLP_VERSION=
 RUN pip3 install --no-cache-dir --break-system-packages "yt-dlp[default,curl-cffi]${YTDLP_VERSION:+==${YTDLP_VERSION}}"
+# The yt-dlp plugin that asks the `pot` service (docker-compose.yml) for YouTube's PO tokens.
+RUN pip3 install --no-cache-dir --break-system-packages bgutil-ytdlp-pot-provider
 
 WORKDIR /app
 COPY package.json package-lock.json ./

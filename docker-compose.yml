@@ -12,6 +12,9 @@ services:
       STREAM_PORT: 8081
       # The address viewers use for the stream port. Behind nginx: https://relay.example.com
       PUBLIC_STREAM_BASE: ${PUBLIC_STREAM_BASE:-http://localhost:${STREAM_HOST_PORT:-8081}}
+      POT_BASE_URL: http://pot:4416
+    depends_on:
+      - pot
     ports:
       # BIND_ADDRESS stays 127.0.0.1 in production so only nginx reaches the ports.
       - "${BIND_ADDRESS:-127.0.0.1}:${CONTROL_HOST_PORT:-8080}:8080"
@@ -20,6 +23,13 @@ services:
       - /tmp/relay:size=${SEGMENT_RAM:-1g},mode=1777 # segments live in RAM
     volumes:
       - channels:/data # saved channels (channels.json)
+
+  # Makes the PO tokens YouTube wants with downloads (bgutil-ytdlp-pot-provider). Reached only by the relay, on the
+  # compose network; no port is published.
+  pot:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    init: true
+    restart: unless-stopped
 
 volumes:
   channels:
